@@ -1,0 +1,39 @@
+# ── Environment / secrets ───────────────────────────────────
+# Real credentials live in .env (never committed); .env.example is the
+# sanitized template that IS committed.
+.env
+.env.*
+!.env.example
+secrets/
+.tokens
+*.tokens
+
+# ── Local inventory (real device IPs & credentials) ──────────
+# Ship a sanitized inventory.example.yaml instead.
+inventory/inventory.yaml
+
+# ── Audit / runtime logs ─────────────────────────────────────
+logs/
+*.jsonl
+
+# ── Timestamped backups (internal working copies) ────────────
+backups/
+.backups/
+
+# ── API specs (large reference files, not distributed) ───────
+openapi*.json
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ── Editor / OS ──────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

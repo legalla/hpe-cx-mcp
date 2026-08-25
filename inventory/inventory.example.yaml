@@ -1,0 +1,174 @@
+# ============================================================
+#  ArubaOS-CX Inventory — arubacx-mcp  (EXAMPLE / TEMPLATE)
+# ============================================================
+#
+# Copy this file to inventory/inventory.yaml and adapt it to your fleet:
+#   cp inventory/inventory.example.yaml inventory/inventory.yaml
+#
+# inventory/inventory.yaml is git-ignored (it holds real IPs & credentials).
+# All IP addresses below use RFC 5737 documentation ranges (192.0.2.0/24,
+# 198.51.100.0/24, 203.0.113.0/24) — replace them with your own.
+#
+# Credentials can also be defined via environment variables:
+#   ARUBA_DEFAULT_USERNAME=admin
+#   ARUBA_DEFAULT_PASSWORD=mypassword
+#   ARUBA_API_VERSION=v10.09
+#
+# Values in this file override environment variables.
+# ============================================================
+#
+# ── Inventory sources & priority (selection) ────────────────
+# This selects WHERE the device list comes from. It is a general inventory
+# notion, valid even when staying fully local (local is NOT "dynamic").
+#
+source: local                   # single source (default if omitted)
+#   source: netbox                 # single external source
+#   source: [local, netbox]        # several sources merged together
+#
+# When several sources are used, a device present in more than one source is
+# taken from the HIGHER-priority source. Priority follows the order of the
+# `source` list, or an explicit `source_priority` (highest first):
+#
+#   source: [local, netbox]
+#   source_priority: [local, netbox]   # local wins over netbox
+#
+# ── Dynamic inventory (external sources of truth) ───────────
+# Only relevant when a source other than `local` is selected above. Pull the
+# device list from an external source of truth: netbox, nautobot or infrahub.
+#
+# Each external source needs a URL + token. Provide them either statically here
+# under `sources:`, or via environment variables:
+#   NetBox   : NETBOX_URL   / NETBOX_TOKEN
+#   Nautobot : NAUTOBOT_URL / NAUTOBOT_TOKEN
+#   Infrahub : INFRAHUB_URL / INFRAHUB_TOKEN   (GraphQL API)
+# Generic per-named-source: <NAME>_URL / <NAME>_TOKEN
+#
+# NEVER hardcode a real token in this file — prefer the environment variables
+# above (see .env.example) so secrets stay out of git.
+#
+# sources:
+#   netbox:
+#     type: netbox                 # netbox | nautobot | infrahub
+#     url: https://netbox.example.com
+#     token: "<api-token>"         # or via NETBOX_TOKEN
+#     verify_ssl: false
+#     timeout: 15
+#   nautobot:
+#     type: nautobot
+#     url: https://nautobot.example.com
+#     # token via NAUTOBOT_TOKEN
+#   infrahub:
+#     type: infrahub
+#     url: https://infrahub.example.com
+#     # token via INFRAHUB_TOKEN
+#     branch: main                 # Infrahub branch to query
+#     device_kind: DcimDevice      # node kind holding the devices
+#     # Related nodes surfaced under `extra`. "location:shortname" reads the
+#     # location's shortname (this schema identifies locations by shortname).
+#     metadata_relationships: ["location:shortname", "zone"]
+#     # Search criterion -> GraphQL filter for this schema.
+#     filter_map:
+#       device_group: device_groups__name__value
+#       location: location__shortname__value
+#       site: location__shortname__value
+#       rack: location__shortname__value
+#       zone: zone__name__value
+#
+# When searching devices (find_devices tool), native filters are: name (the
+# device), site, tenant, location, rack, zone, device_group, tag. For Infrahub
+# `device_group` filters on group membership and location/site/rack/zone on the
+# location relationships. Any other attribute is resolved as a NetBox/Nautobot
+# CUSTOM FIELD (and matched against tags for the local source).
+#
+# ── Credentials & HashiCorp Vault (optional) ────────────────
+# Credentials priority (highest first):
+#   1) device-specific credentials (set on the device entry below)
+#   2) HashiCorp Vault (if `vault` is enabled globally or per device)
+#   3) environment variables / defaults
+#
+# Enable Vault globally with a shorthand or a detailed block. URL/token come
+# from VAULT_ADDR / VAULT_TOKEN env vars (or url/token keys here).
+#
+#   vault: true                    # shorthand: enable for all devices
+#
+#   vault:
+#     enabled: true
+#     # url: https://vault.example.com   # or VAULT_ADDR
+#     # token: "<vault-token>"           # or VAULT_TOKEN
+#     mount: secret                 # KV mount (default: secret)
+#     kv_version: 2                 # 1 or 2 (default: 2)
+#     path_template: "{device}"     # secret path, {device} = device name
+#
+# A single device can opt into Vault with `vault: true` on its entry.
+# ============================================================
+
+# ── Default values (overridden per device) ──────────────────
+defaults:
+  username: admin
+  password: ""              # set via ARUBA_DEFAULT_PASSWORD env var, Vault, or per device
+  api_version: latest       # dynamic detection via https://<switch>/rest, then use latest.version
+  verify_ssl: false
+  timeout: 30
+  access_mode: read-only    # set to read-write to allow configuration changes
+  # site: campus-principal  # optional default site (inherited by devices without 'site')
+
+# ── Device list ──────────────────────────────────────────────
+#
+# The 'site' concept is OPTIONAL. Two ways to use it:
+#   1) A 'site' field per device (below).
+#   2) A 'sites:' block grouping devices together (see example at the end of the file).
+# Tools accept a 'site' parameter to operate only on devices in that site
+# (for example list_devices(site=...), run_on_site(site, ...)).
+devices:
+
+  # Dict format (name = key)
+
+  Core-01:
+    host: 192.0.2.10
+    platform: aoscx
+    description: "Core switch"
+    tags: [core, campus]
+    site: campus-principal
+    api_version: latest
+    # access_mode: read-write
+
+  Access-01:
+    host: 192.0.2.20
+    description: "Access switch - floor 1"
+    tags: [access, leaf, campus]
+    timeout: 15
+    site: campus-principal
+    # access_mode: read-write
+
+  Access-02:
+    host: 192.0.2.21
+    description: "Access switch - floor 2"
+    tags: [access, leaf, campus]
+    site: campus-principal
+    # Per-device credentials override the defaults / env vars:
+    # username: admin
+    # password: "<device-specific-password>"
+
+  Remote-01:
+    host: 198.51.100.10
+    description: "Remote Access 1"
+    tags: [access, leaf, campus, remote]
+    site: site-distant
+
+  Leaf-01:
+    host: 203.0.113.10
+    description: "DC Leaf 1"
+    tags: [leaf, dc]
+    site: dc
+
+# ── Alternative format: explicit site grouping (optional) ──────────
+# sites:
+#   campus-principal:
+#     # optional overrides shared by the site (username, api_version, timeout...)
+#     devices:
+#       Core-01:
+#         host: 192.0.2.10
+#   site-distant:
+#     devices:
+#       Remote-01:
+#         host: 198.51.100.10

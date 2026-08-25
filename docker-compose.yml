@@ -1,0 +1,69 @@
+services:
+  hpe-cx-mcp:
+    build: .
+    image: hpe-cx-mcp:latest
+    container_name: hpe-cx-mcp
+    restart: unless-stopped
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./inventory:/app/inventory:ro
+      - ./logs:/app/logs
+      - ./secrets:/app/secrets
+    # Secrets & deployment-specific values live in .env (git-ignored).
+    # Copy .env.example to .env and fill it in. Provides:
+    #   ARUBA_DEFAULT_USERNAME / ARUBA_DEFAULT_PASSWORD / ARUBA_API_VERSION
+    #   NETBOX_URL / NETBOX_TOKEN / INFRAHUB_URL / INFRAHUB_TOKEN
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT:          streamable-http
+      MCP_HOST:               0.0.0.0
+      MCP_PORT:               "8000"
+      INVENTORY_FILE:         /app/inventory/inventory.yaml
+      # ── Bearer authentication (named tokens) — OFF by default ──────────
+      # Set to "true" to require a valid Bearer token on every MCP request.
+      # The server then REFUSES TO START if no valid token exists in the file.
+      # Generate tokens inside the container with:
+      #   docker compose exec hpe-cx-mcp python cx_token_manager.py generate --name <client>
+      CX_AUTH_ENABLED:        "true"
+      CX_TOKENS_FILE:         /app/secrets/.tokens
+      # CX_TRUST_FORWARDED_FOR: "false"   # set true only behind a trusted proxy
+      # ── FastMCP log verbosity — OPTIONAL (default INFO) ────────────────
+      # Uncomment and set to DEBUG to get verbose FastMCP logging (useful to
+      # trace tool invocations / payloads). Accepts DEBUG|INFO|WARNING|ERROR.
+      # FASTMCP_LOG_LEVEL:      "DEBUG"
+      # ── Audit logging (structured JSON lines) — OFF by default ─────────
+      CX_AUDIT_ENABLED:       "false"
+      CX_AUDIT_FILE:          /app/logs/audit.jsonl
+      CX_AUDIT_LEVEL:         "all"        # "all" or "writes"
+      # CX_AUDIT_STDOUT:       "false"     # also mirror audit records to stdout
+      # ── Progressive disclosure (Tier-1/Tier-2) + functional prefixes ───
+      # CX_DEFERRED_TOOLS: advertise only ~25 Tier-1 tools; reach the rest via
+      #   the meta-tools search_tools / invoke_tool. CX_TOOL_PREFIXES: rename
+      #   advertised tools as <domain>__<name> (e.g. routing__get_bgp_neighbors).
+      CX_DEFERRED_TOOLS:      "true"
+      CX_TOOL_PREFIXES:       "true"
+      # ── Flat toolset (collapse the ~101 atomic tools into ~23 dispatchers) ─
+      # CX_FLAT_TOOLSET takes PRECEDENCE and is now the DEFAULT (true even if the
+      #   variable is absent). When active, the deferred Tier-1/2 layer and the
+      #   functional prefixes above are skipped, and the server advertises ~23
+      #   flat scope/action dispatchers instead. Set "false" for an instant
+      #   rollback to the deferred-tools behaviour.
+      CX_FLAT_TOOLSET:        "true"
+      CX_INVOKE_WRITES:       "true"       # allow write tools through invoke_tool
+      # CX_SSH_TOOL_REDIRECT (default "true"): refuse SSH/cli 'show' commands that
+      #   a dedicated tool already covers and redirect the agent to that tool.
+      #   Set "false" to keep only the docstring guidance. Per-call: force=true.
+      CX_SSH_TOOL_REDIRECT:   "true"
+      # ── Write safety: dry_run_token preview + rollback_id ──────────────
+      # CX_WRITE_SAFETY enables apply_plan/rollback + dry_run tokens. When
+      # CX_REQUIRE_DRY_RUN_TOKEN is true, a direct apply via invoke_tool is
+      # refused — callers must preview (apply=false) then apply_plan(token).
+      CX_WRITE_SAFETY:        "true"
+      CX_REQUIRE_DRY_RUN_TOKEN: "false"
+      CX_DRY_RUN_TTL:         "900"        # token lifetime (seconds)
+      # Write-safety stores live in a writable, mounted dir (uid 1000).
+      CX_SECRETS_DIR:         /app/logs
+    # Decommenter si les switches sont sur le reseau local du serveur Docker :
+    # network_mode: host
