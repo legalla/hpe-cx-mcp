@@ -258,6 +258,11 @@ preview→`apply_plan` path.
   - Linux: Docker Engine + the Compose plugin.
 - Network reachability from the Docker host to the switches' management IPs
   (HTTPS/443 for REST, TCP/22 for SSH).
+- **REST access must be configured on the target devices and in the correct VRF**:
+  in **Read-Write** mode for Read and Write access, and **Read-only** mode for
+  read-only access.
+- **SSH access must also be configured** on the target devices for the tools that
+  require it.
 
 ### Configure (first run)
 
