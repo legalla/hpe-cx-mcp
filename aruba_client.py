@@ -5442,6 +5442,35 @@ class ArubaOSCXClient:
         (e.g. '/rest/v10.17/system/vlans/200')."""
         return f"/rest/{self.api_version}{path}"
 
+    @staticmethod
+    def _deep_merge(base: dict, overrides: dict) -> dict:
+        """Recursively merge `overrides` into `base` in place and return `base`.
+        Nested dicts are merged key by key; scalars and lists replace outright.
+        Used for read-modify-write so a sparse update never wipes sibling
+        writable attributes the firmware would otherwise reset to default."""
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                ArubaOSCXClient._deep_merge(base[key], value)
+            else:
+                base[key] = value
+        return base
+
+    async def _read_writable(self, path: str, *, depth: int = 1) -> Optional[dict]:
+        """GET the writable configuration of a resource for read-modify-write.
+        A plain PUT to AOS-CX replaces the whole writable object, so any attribute
+        omitted from the body is reset to its default. Fetching the current
+        writable payload first lets the caller merge only its changes and PUT the
+        full object back, leaving every other attribute intact. Returns None when
+        the resource is absent (404) so the caller can POST-create instead."""
+        try:
+            data = await self._get(
+                path, params={"depth": str(depth), "selector": "writable"})
+            return data if isinstance(data, dict) else {}
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
     async def vlan_exists(self, vlan_id: int) -> bool:
         try:
             await self._get(f"/system/vlans/{vlan_id}", params={"depth": "1"})
@@ -5945,29 +5974,49 @@ class ArubaOSCXClient:
                                          enable: bool = True,
                                          extra: Optional[dict] = None) -> dict:
         """Turn a physical port into a routed (L3) interface (idempotent).
-        Used for point-to-point underlay links (no switchport, /31 or /30 IP)."""
+        Used for point-to-point underlay links (no switchport, /31 or /30 IP).
+
+        Read-modify-write: the current writable payload is fetched first and the
+        changes merged into it, so sibling attributes are never wiped. `enable`
+        drives `user_config.admin`; `mtu` is applied to BOTH `ip_mtu` (L3) and
+        `user_config.mtu` (physical) so the effective MTU actually changes;
+        omitting `ip_cidr` keeps the existing IP instead of clearing it."""
         if ip_cidr is not None:
             ip_cidr = _v_ipv4_cidr(ip_cidr, "ip_cidr")
         if mtu is not None:
             mtu = _v_mtu(mtu, "mtu")
         encoded = quote(name, safe="")
-        body: dict[str, Any] = {
+        path = f"/system/interfaces/{encoded}"
+        body = await self._read_writable(path) or {}
+        changes: dict[str, Any] = {
             "routing": True,
             "user_config": {"admin": "up" if enable else "down"},
         }
         if ip_cidr is not None:
-            body["ip4_address"] = ip_cidr
+            changes["ip4_address"] = ip_cidr
         if description is not None:
-            body["description"] = description
+            changes["description"] = description
         if mtu is not None:
-            body["ip_mtu"] = int(mtu)
+            changes["ip_mtu"] = int(mtu)
+            changes["user_config"]["mtu"] = int(mtu)
         if vrf and vrf != "default":
-            body["vrf"] = {vrf: self._uri(f"/system/vrfs/{quote(vrf, safe='')}")}
+            body["vrf"] = None  # drop any prior VRF ref before re-binding
+            changes["vrf"] = {vrf: self._uri(f"/system/vrfs/{quote(vrf, safe='')}")}
         if extra:
-            body.update({k: v for k, v in extra.items() if v is not None})
-        await self._put(f"/system/interfaces/{encoded}", body)
-        return {"interface": name, "ip4_address": ip_cidr, "vrf": vrf,
-                "status": "configured"}
+            changes.update({k: v for k, v in extra.items() if v is not None})
+        # Switching -> routing transition: clear L2-only attributes the firmware
+        # rejects on a routed port (the old sparse PUT dropped them implicitly).
+        if not body.get("routing"):
+            for l2_key in ("vlan_mode", "vlan_tag"):
+                if l2_key in body:
+                    body[l2_key] = None
+            for l2_key in ("vlan_trunks", "vlan_translations"):
+                if l2_key in body:
+                    body[l2_key] = {}
+        self._deep_merge(body, changes)
+        await self._put(path, body)
+        return {"interface": name, "ip4_address": body.get("ip4_address"),
+                "vrf": vrf, "status": "configured"}
 
     # ─── Domain: VXLAN (VTEP interface + static peers) ────────────────────────
 
@@ -6170,16 +6219,11 @@ class ArubaOSCXClient:
             config["passive_interface_default"] = bool(passive_interface_default)
         if extra:
             config.update({k: v for k, v in extra.items() if v is not None})
-        exists = False
-        try:
-            await self._get(f"{base}/{instance_tag}", params={"depth": "1"})
-            exists = True
-        except ArubaAPIError as exc:
-            if exc.status_code != 404:
-                raise
-        if exists:
+        existing = await self._read_writable(f"{base}/{instance_tag}")
+        if existing is not None:
             if config:
-                await self._put(f"{base}/{instance_tag}", config)
+                self._deep_merge(existing, config)
+                await self._put(f"{base}/{instance_tag}", existing)
             action = "updated" if config else "already_exists"
         else:
             await self._post(base, {"instance_tag": int(instance_tag), **config})
@@ -6196,16 +6240,11 @@ class ArubaOSCXClient:
         if area_type is not None:
             config["area_type"] = area_type
         key = quote(str(area_id), safe="")
-        exists = False
-        try:
-            await self._get(f"{base}/{key}", params={"depth": "1"})
-            exists = True
-        except ArubaAPIError as exc:
-            if exc.status_code != 404:
-                raise
-        if exists:
+        existing = await self._read_writable(f"{base}/{key}")
+        if existing is not None:
             if config:
-                await self._put(f"{base}/{key}", config)
+                self._deep_merge(existing, config)
+                await self._put(f"{base}/{key}", existing)
             action = "updated" if config else "already_exists"
         else:
             await self._post(base, {"area_id": str(area_id), **config})
@@ -6223,15 +6262,10 @@ class ArubaOSCXClient:
             "port": self._uri(f"/system/interfaces/{quote(interface, safe='')}")}
         if extra:
             config.update({k: v for k, v in extra.items() if v is not None})
-        exists = False
-        try:
-            await self._get(f"{base}/{key}", params={"depth": "1"})
-            exists = True
-        except ArubaAPIError as exc:
-            if exc.status_code != 404:
-                raise
-        if exists:
-            await self._put(f"{base}/{key}", config)
+        existing = await self._read_writable(f"{base}/{key}")
+        if existing is not None:
+            self._deep_merge(existing, config)
+            await self._put(f"{base}/{key}", existing)
             action = "updated"
         else:
             await self._post(base, {"interface_name": interface, **config})
@@ -6264,9 +6298,11 @@ class ArubaOSCXClient:
         if extra:
             config.update({k: v for k, v in extra.items() if v is not None})
         base = f"/system/vrfs/{quote(vrf, safe='')}/bgp_routers"
-        if await self.bgp_router_exists(asn, vrf):
+        existing = await self._read_writable(f"{base}/{asn}")
+        if existing is not None:
             if config:
-                await self._put(f"{base}/{asn}", config)
+                self._deep_merge(existing, config)
+                await self._put(f"{base}/{asn}", existing)
             return {"asn": asn, "vrf": vrf,
                     "status": "updated" if config else "already_exists"}
         await self._post(base, {"asn": int(asn), **config})
@@ -6339,15 +6375,10 @@ class ArubaOSCXClient:
             config["shutdown"] = bool(shutdown)
         if extra:
             config.update({k: v for k, v in extra.items() if v is not None})
-        exists = False
-        try:
-            await self._get(f"{base}/{key}", params={"depth": "1"})
-            exists = True
-        except ArubaAPIError as exc:
-            if exc.status_code != 404:
-                raise
-        if exists:
-            await self._put(f"{base}/{key}", config)
+        existing = await self._read_writable(f"{base}/{key}")
+        if existing is not None:
+            self._deep_merge(existing, config)
+            await self._put(f"{base}/{key}", existing)
             action = "updated"
         else:
             await self._post(base, {"ip_or_ifname_or_group_name": neighbor, **config})
