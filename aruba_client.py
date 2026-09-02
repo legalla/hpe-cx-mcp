@@ -1233,6 +1233,93 @@ class ArubaOSCXClient:
             "with_alarms": len(faults),
         }
 
+    async def get_poe_status(self, interface_name: Optional[str] = None) -> dict:
+        """PoE (Power over Ethernet) status: per-port power draw (Watts/current/
+        voltage), powering state, powered-device type/class, plus the
+        chassis-wide PoE power budget (available/drawn/reserved/redundant/
+        failover power supplied by the PSUs).
+
+        Pass `interface_name` for a single port, otherwise every PoE-capable
+        port is scanned in parallel (detected via the `poe_interface` reference
+        on /system/interfaces)."""
+        if interface_name:
+            encoded = quote(interface_name, safe="")
+            try:
+                data = await self._get(f"/system/interfaces/{encoded}/poe_interface", params={"depth": "2"})
+            except ArubaAPIError as exc:
+                if exc.status_code == 404:
+                    raise ArubaAPIError(
+                        f"Interface '{interface_name}' not found or not PoE-capable.", 404)
+                raise
+            ports = [_format_poe_interface(interface_name, data)]
+        else:
+            ifaces_data = await self._get("/system/interfaces", params={"depth": "2"})
+            poe_capable = [name for name, raw in self._collection_items(ifaces_data)
+                           if isinstance(raw, dict) and raw.get("poe_interface")]
+
+            sem = asyncio.Semaphore(8)
+
+            async def _fetch(name: str) -> tuple[str, Any]:
+                async with sem:
+                    encoded = quote(name, safe="")
+                    try:
+                        data = await self._get(f"/system/interfaces/{encoded}/poe_interface", params={"depth": "2"})
+                    except ArubaAPIError:
+                        return name, None
+                    return name, data
+
+            fetched = await asyncio.gather(*[_fetch(n) for n in poe_capable])
+            ports = [_format_poe_interface(n, d) for n, d in fetched if isinstance(d, dict)]
+
+        powered = [p for p in ports if p["powering_status"] == "delivering"]
+        total_drawn_w = round(
+            sum(p["power_drawn_w"] for p in powered if isinstance(p["power_drawn_w"], (int, float))), 1)
+
+        budget = await self._get_poe_chassis_budget()
+
+        return {
+            "ports": ports,
+            "count": len(ports),
+            "powered_count": len(powered),
+            "total_drawn_w": total_drawn_w,
+            "budget": budget,
+        }
+
+    async def _get_poe_chassis_budget(self) -> dict:
+        """Chassis-wide PoE power budget, aggregated across every `chassis`
+        subsystem (stacks/VSF have one per member). Source: Subsystem.poe_power
+        (available/drawn/reserved/redundant/failover, in Watts) and
+        Subsystem.poe_power_consumed_average."""
+        listing = await self._get("/system/subsystems", params={"depth": "1"})
+        chassis_keys = [str(key) for key, _ in self._collection_items(listing)
+                        if _parse_subsystem_key(str(key))[0] == "chassis"]
+
+        budgets: list[dict] = []
+        for key in chassis_keys:
+            encoded = quote(key, safe="")
+            try:
+                sub = await self._get(f"/system/subsystems/{encoded}", params={"depth": "1"})
+            except ArubaAPIError:
+                continue
+            if not isinstance(sub, dict):
+                continue
+            poe_power = sub.get("poe_power") if isinstance(sub.get("poe_power"), dict) else {}
+            consumed_avg = sub.get("poe_power_consumed_average")
+            if not poe_power and consumed_avg is None:
+                continue  # this chassis has no PoE capability
+            _, sname = _parse_subsystem_key(key)
+            budgets.append({
+                "chassis": sname,
+                "available_power_w": poe_power.get("available_power", "N/A"),
+                "drawn_power_w": poe_power.get("drawn_power", "N/A"),
+                "reserved_power_w": poe_power.get("reserved_power", "N/A"),
+                "redundant_power_w": poe_power.get("redundant_power", "N/A"),
+                "failover_power_w": poe_power.get("failover_power", "N/A"),
+                "consumed_average_w": consumed_avg if consumed_avg is not None else "N/A",
+            })
+
+        return {"per_chassis": budgets, "supported": len(budgets) > 0}
+
     # ─── Interfaces ───────────────────────────────────────────────────────────
 
     async def get_interfaces(self, interface_name: Optional[str] = None) -> dict:
@@ -7849,6 +7936,44 @@ def _extract_temps_from_sub(sub: dict) -> list[dict]:
             "fan_state": sensor.get("fan_state", "N/A"),
         })
     return out
+
+
+def _format_poe_interface(name: str, data: dict) -> dict:
+    """Format a PoE_Interface payload (GET /system/interfaces/{name}/poe_interface).
+
+    `status`/`pd_information` are keyed by 'port' for single-signature PDs, or
+    by 'pair-a'/'pair-b' for 4-pair dual-signature PDs — the first (or only)
+    entry is surfaced as the primary status, and classifications are kept per
+    pair."""
+    config = data.get("config") if isinstance(data.get("config"), dict) else {}
+    measurements = data.get("measurements") if isinstance(data.get("measurements"), dict) else {}
+    status = data.get("status") if isinstance(data.get("status"), dict) else {}
+    pd_info = data.get("pd_information") if isinstance(data.get("pd_information"), dict) else {}
+
+    primary_status = status.get("port") if isinstance(status.get("port"), dict) else None
+    if primary_status is None:
+        primary_status = next((v for v in status.values() if isinstance(v, dict)), {})
+    classifications = {
+        key: (val.get("power_classification", "N/A") if isinstance(val, dict) else "N/A")
+        for key, val in pd_info.items()
+    }
+
+    return {
+        "interface": name,
+        "admin_disabled": bool(config.get("admin_disable", False)),
+        "priority": config.get("priority", "N/A"),
+        "allocate_by_method": config.get("allocate_by_method", "N/A"),
+        "powering_status": primary_status.get("powering_status", "N/A"),
+        "fault_reason": primary_status.get("fault_reason", "N/A"),
+        "pd_type": data.get("pd_type", "N/A"),
+        "pd_signature": data.get("pd_signature", "N/A"),
+        "pd_classification": classifications or {},
+        "average_power_w": measurements.get("average_power", "N/A"),
+        "peak_power_w": measurements.get("peak_power", "N/A"),
+        "power_drawn_w": measurements.get("power_drawn", "N/A"),
+        "current_a": measurements.get("current", "N/A"),
+        "voltage_v": measurements.get("voltage", "N/A"),
+    }
 
 
 def _extract_leds_from_sub(sub: dict) -> list[dict]:

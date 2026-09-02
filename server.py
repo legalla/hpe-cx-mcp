@@ -17,6 +17,7 @@ from aruba_client import (
     _v_vlan, _v_vni, _v_mtu, _v_asn, _v_route_target, _v_ospf_area,
 )
 from config import DeviceConfig, load_inventory, Inventory, InventoryError
+from config_backup import ConfigBackupError, export_config
 from inventory_sources import InventoryManager, InventorySourceError
 from ssh_client import ArubaOSCXSSHClient, ArubaSSHError
 import cx_auth
@@ -871,6 +872,7 @@ _SITE_OPERATIONS: dict[str, str] = {
     "get_interfaces": "get_interfaces",
     "get_interface_counters": "get_interface_counters",
     "get_supported_transceivers": "get_supported_transceivers",
+    "get_poe_status": "get_poe_status",
     "get_loopbacks": "get_loopbacks",
     "get_routed_ports": "get_routed_ports",
     "get_vlan_interfaces": "get_vlan_interfaces",
@@ -1263,6 +1265,19 @@ async def get_supported_transceivers(device: str, search: str = None) -> dict:
     description."""
     async with _get_client(device) as client:
         return await client.get_supported_transceivers(search)
+
+
+@mcp.tool()
+async def get_poe_status(device: str, interface: str = None) -> dict:
+    """PoE (Power over Ethernet) status: per-port power draw (watts/current/
+    voltage), powering state (delivering/searching/denied/fault/…), powered-
+    device type/class, plus the chassis-wide PoE power budget (available/
+    drawn/reserved/redundant/failover power, in watts, supplied by the PSUs).
+    `interface` to target a single port, otherwise every PoE-capable port is
+    scanned. Use this to answer 'how much power is this site/switch/port
+    drawing over PoE'."""
+    async with _get_client(device) as client:
+        return await client.get_poe_status(interface)
 
 
 @mcp.tool()
@@ -2003,6 +2018,82 @@ async def manage_config(
                 "restore_checkpoint", "auto_checkpoint", "confirm", "diff",
             ],
         }
+
+
+@mcp.tool()
+async def backup_config(
+    device: str = None,
+    site: str = None,
+    protocol: str = "sftp",
+    server: str = None,
+    remote_directory: str = None,
+    filename_format: str = None,
+    source: str = "running-config",
+) -> dict:
+    """Export a configuration backup campaign to a configured SFTP or TFTP server.
+
+    Target one `device` or every device in `site`. `server` must match the
+    configured `CX_BACKUP_<PROTOCOL>_HOST` when that variable is set. `protocol`
+    is sftp (default) or tftp. `source` is
+    running-config (default) or startup-config. `filename_format` supports only
+    `{hostname}` and `{timestamp}`; default: `{hostname}_{timestamp}_config.cfg`.
+    SFTP credentials are read only from CX_BACKUP_SFTP_* environment variables;
+    TFTP does not use credentials.
+    """
+    protocol = (protocol or "sftp").strip().lower()
+    if protocol not in ("sftp", "tftp"):
+        return {"status": "invalid_input", "field": "protocol",
+                "error": "protocol must be 'sftp' or 'tftp'."}
+    if source not in ("running-config", "startup-config"):
+        return {
+            "status": "invalid_input",
+            "field": "source",
+            "error": "source must be 'running-config' or 'startup-config'.",
+        }
+    try:
+        device_names = _resolve_devices(device=device, site=site)
+    except ValueError as exc:
+        return {"status": "invalid_input", "error": str(exc)}
+
+    async def _backup_one(name: str) -> tuple[str, dict]:
+        try:
+            async with _get_client(name) as client:
+                config = await client.get_config(name=source)
+                hostname = name
+                try:
+                    system = await client.get_system_info()
+                    hostname = system.get("hostname") or name
+                except Exception:  # noqa: BLE001 - inventory name is a safe fallback
+                    pass
+                exported = await export_config(
+                    protocol=protocol,
+                    server=server,
+                    remote_directory=remote_directory,
+                    filename_format=filename_format,
+                    hostname=str(hostname),
+                    content=config["content"],
+                )
+            return name, {"ok": True, "source": source, **exported}
+        except (ConfigBackupError, ArubaAPIError, KeyError) as exc:
+            return name, {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - one target must not stop a campaign
+            return name, {"ok": False, "error": str(exc)}
+
+    results = dict(await asyncio.gather(*[_backup_one(name) for name in device_names]))
+    failed = [name for name, result in results.items() if not result["ok"]]
+    return {
+        "status": "exported" if not failed else "partial",
+        "protocol": protocol,
+        "source": source,
+        "targets": device_names,
+        "results": results,
+        "summary": {
+            "total": len(device_names),
+            "succeeded": len(device_names) - len(failed),
+            "failed": len(failed),
+            "failed_devices": failed,
+        },
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════

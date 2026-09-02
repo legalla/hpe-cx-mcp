@@ -26,6 +26,7 @@ from logging.handlers import RotatingFileHandler
 _WRITE_PREFIXES = ("configure_", "create_", "delete_", "add_", "set_", "apply_", "render_", "load_")
 _WRITE_NAMES = {
     "manage_config",
+    "backup_config",
     "run_cli_command",
     "run_ssh_command",
     "run_ssh_commands",

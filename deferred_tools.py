@@ -106,7 +106,7 @@ TIER1: set[str] = {
     # Universal escape hatches
     "run_cli_command", "get_raw_api", "run_ssh_command",
     # Config read / save
-    "get_config", "manage_config",
+    "get_config", "manage_config", "backup_config",
     # Orchestrated provisioning
     "create_vlan_service", "delete_vlan_service",
     # Hygiene + write-safety rollback (Tier-1 meta)
@@ -127,6 +127,7 @@ WRITE_TOOLS: set[str] = {
     "configure_port_auth", "configure_app_recognition", "configure_virtual_mac",
     "configure_aaa", "configure_user_roles",
     "run_ssh_commands", "refresh_inventory",
+    "backup_config",
 }
 
 
@@ -140,6 +141,7 @@ TOOL_TAGS: dict[str, list[str]] = {
     "list_inventory_sources": ["inventory", "sources"],
     "refresh_inventory": ["inventory", "reload", "write"],
     "run_ssh_commands": ["cli", "ssh", "batch", "write"],
+    "backup_config": ["config", "backup", "export", "sftp", "campaign"],
     # System / hardware
     "get_boot_history": ["system", "boot", "reboot", "uptime"],
     "get_ssh_config": ["system", "ssh", "management"],

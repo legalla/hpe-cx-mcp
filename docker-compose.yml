@@ -65,5 +65,21 @@ services:
       CX_DRY_RUN_TTL:         "900"        # token lifetime (seconds)
       # Write-safety stores live in a writable, mounted dir (uid 1000).
       CX_SECRETS_DIR:         /app/logs
+      # ── SFTP configuration backup campaigns ──────────────────────────
+      # Put the credentials in .env, never in MCP tool arguments or inventory.
+      # The optional allowed-host list prevents an agent from exporting to an
+      # unapproved destination. `server` defaults to CX_BACKUP_SFTP_HOST.
+      # CX_BACKUP_SFTP_HOST: backup.example.net
+      # CX_BACKUP_SFTP_PORT: "22"
+      # CX_BACKUP_SFTP_DIRECTORY: /network-backups/cx
+      # CX_BACKUP_SFTP_ALLOWED_HOSTS: backup.example.net
+      # CX_BACKUP_SFTP_TIMEOUT: "30"
+      # TFTP is supported for clients that require it. It has neither encryption
+      # nor authentication, so restrict it to a trusted management network.
+      # CX_BACKUP_TFTP_HOST: tftp.example.net
+      # CX_BACKUP_TFTP_PORT: "69"
+      # CX_BACKUP_TFTP_DIRECTORY: network-backups/cx
+      # CX_BACKUP_TFTP_ALLOWED_HOSTS: tftp.example.net
+      # CX_BACKUP_TFTP_TIMEOUT: "30"
     # Decommenter si les switches sont sur le reseau local du serveur Docker :
     # network_mode: host

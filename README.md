@@ -98,7 +98,9 @@ tools additionally require the device to be `read-write`.
 
 ### System & hardware
 `get_system_info`, `get_hardware_health`, `get_boot_history`, `get_transceivers`,
-`get_ssh_config`, `get_logs`.
+`get_ssh_config`, `get_logs`, `get_poe_status` (Power-over-Ethernet: per-port
+draw in watts/amps/volts, powering state, powered-device class, plus the
+chassis-wide PoE power budget).
 
 ### Containers & licensing
 `get_containers` (on-switch application containers: status, image, CPU/memory
@@ -141,7 +143,8 @@ instantiation, config source, location, VRF/source IP, Activate connectivity).
 
 ### Configuration management
 `list_configs`, `get_config`, `get_full_config`, `compare_configs`,
-`manage_config` (save / checkpoint / rollback).
+`manage_config` (save / checkpoint / rollback), `backup_config` (export
+campaign to an external SFTP/TFTP server, see [§5](#5-environment-variables)).
 
 ### Configure (write) + verify pairs
 Each `configure_*` tool has a matching `verify_*` read-back tool:
@@ -170,8 +173,9 @@ The server can expose its capabilities in two **mutually exclusive** ways, chose
 by the `CX_FLAT_TOOLSET` flag (see [§5](#5-environment-variables)):
 
 **Flat toolset (`CX_FLAT_TOOLSET=true` — the default).** The ~101 atomic tools
-listed above are collapsed into **~23 flat dispatchers** driven by a `scope`
-(and, for writes, an `action`) argument. The underlying REST client code is
+listed above are collapsed into **17 flat dispatchers** (plus the 8 kept-atomic
+tools below — 25 tools advertised in total) driven by a `scope` (and, for
+writes, an `action`) argument. The underlying REST client code is
 unchanged — the dispatchers only *route* to it, so there is no behavioural
 regression. Every read dispatcher also accepts **`device: str | list`**, **`site`**
 or **`source`** (an external source-of-truth query) and fans the call out in
@@ -181,7 +185,7 @@ parallel, returning one envelope `{scope, results, errors, summary}`. An optiona
 | Dispatcher | `scope` values |
 |------------|----------------|
 | `get_system` | `info`, `inventory`, `environment`, `capacity`, `boot`, `maintenance`, `containers`, `feature_pack`, `central`, `ssh` |
-| `get_interfaces` | `physical`, `transceivers`, `loopbacks`, `routed`, `svi`, `lag` |
+| `get_interfaces` | `physical`, `transceivers`, `loopbacks`, `routed`, `svi`, `lag`, `poe` |
 | `get_switching` | `vlans`, `mac`, `lldp`, `spanning_tree` |
 | `get_routing` | `bgp_summary`, `bgp_neighbors`, `bgp_config`, `bgp_routes`, `ospf_overview`, `ospf_neighbors`, `ospf_interfaces`, `route_table`, `arp` |
 | `get_overlay` | `evpn_config`, `evpn_routes`, `evpn_multihoming`, `vtep_neighbors`, `vxlan_config`, `vxlan_tunnels`, `vxlan_static_peers` |
@@ -196,9 +200,10 @@ parallel, returning one envelope `{scope, results, errors, summary}`. An optiona
 | `configure_security` | `port_auth`, `aaa`, `user_roles`, `app_recognition` — `action`: `plan`/`apply`/`verify` |
 | `configure_service` | `vlan` — `action`: `plan`/`apply`/`delete`/`delete_plan`/`verify` |
 | `diagnose` | `device`, `evpn`, `client` (deterministic multi-check bundle) |
+| `troubleshoot` | omit `feature_name` to list supported features/components; pass it to run (`choice`: `basic-health`/`config`/`health`/`operations`/`detailed`) — AOS-CX 10.18+ |
 
-Plus 7 kept-atomic tools: `list_devices`, `list_sites`, `get_logs`,
-`run_ssh_commands`, `manage_config`, `logout`, `rollback`. Write dispatchers keep
+Plus 8 kept-atomic tools: `list_devices`, `list_sites`, `get_logs`,
+`run_ssh_commands`, `manage_config`, `backup_config`, `logout`, `rollback`. Write dispatchers keep
 the **plan → apply → verify** lifecycle and the per-device read-only guard. Domain
 fields are passed in a `params` object (keys documented in each dispatcher's
 docstring).
@@ -415,6 +420,30 @@ under `environment:`. Booleans accept `true/1/yes/on`.
 | `<NAME>_URL` / `<NAME>_TOKEN` | — | Generic per-named-source connection. |
 | `VAULT_ADDR` / `VAULT_TOKEN` | — | HashiCorp Vault for credential resolution. |
 
+### SFTP/TFTP configuration backups
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CX_BACKUP_SFTP_HOST` | — | Approved SFTP backup server. A `server` passed to `backup_config` must match it. |
+| `CX_BACKUP_SFTP_USERNAME` / `CX_BACKUP_SFTP_PASSWORD` | — | SFTP credentials; set in `.env`, never in MCP arguments. |
+| `CX_BACKUP_SFTP_PORT` | `22` | SFTP port. |
+| `CX_BACKUP_SFTP_DIRECTORY` | `/` | Default absolute directory on the SFTP server. |
+| `CX_BACKUP_SFTP_ALLOWED_HOSTS` | — | Optional comma-separated target allow-list. |
+| `CX_BACKUP_SFTP_TIMEOUT` | `30` | Connection and transfer timeout in seconds. |
+| `CX_BACKUP_TFTP_HOST` | — | Approved TFTP backup server. A `server` passed to `backup_config(protocol="tftp")` must match it. |
+| `CX_BACKUP_TFTP_PORT` | `69` | TFTP port. |
+| `CX_BACKUP_TFTP_DIRECTORY` | `/` | Default relative directory prefix on the TFTP server. |
+| `CX_BACKUP_TFTP_ALLOWED_HOSTS` | — | Optional comma-separated target allow-list. |
+| `CX_BACKUP_TFTP_TIMEOUT` | `30` | Transfer timeout in seconds. |
+
+Use `backup_config` to run an export campaign for a `device` or an entire
+`site`. `protocol="sftp"` is the default; `protocol="tftp"` is available for
+legacy backup servers but has neither encryption nor authentication, so use it
+only on a trusted management network. It transfers `running-config` by default (or `startup-config`) and
+returns the remote path and byte count per device, never the configuration
+content. The default filename is `{hostname}_{timestamp}_config.cfg`; pass
+`filename_format` to change it. Only `{hostname}` and UTC `{timestamp}`
+(`YYYYMMDDTHHMMSSZ`) are permitted.
+
 ### Bearer authentication (optional, OFF by default)
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -433,7 +462,7 @@ under `environment:`. Booleans accept `true/1/yes/on`.
 ### Progressive disclosure, prefixes & write safety (optional)
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CX_FLAT_TOOLSET` | `true` | Collapse the ~101 atomic tools into ~23 flat `scope`/`action` dispatchers. Takes precedence: when on, the three layers below are skipped. Set `false` to opt back into the legacy atomic tools. |
+| `CX_FLAT_TOOLSET` | `true` | Collapse the ~101 atomic tools into 17 flat `scope`/`action` dispatchers (25 tools advertised total, incl. 8 kept-atomic). Takes precedence: when on, the three layers below are skipped. Set `false` to opt back into the legacy atomic tools. |
 | `CX_DEFERRED_TOOLS` | `false` | (Legacy mode only) Advertise only Tier-1 tools; reach the rest via `search_tools` / `invoke_tool`. |
 | `CX_TOOL_PREFIXES` | `false` | (Legacy mode only) Rename advertised tools `<domain>__<tool>` (e.g. `routing__get_bgp_neighbors`). |
 | `CX_INVOKE_WRITES` | `true` | Allow write tools to run through `invoke_tool`. |

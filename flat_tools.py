@@ -242,6 +242,7 @@ _MAP_INTERFACES = {
     "physical": "get_interfaces", "transceivers": "get_transceivers",
     "counters": "get_interface_counters",
     "supported_transceivers": "get_supported_transceivers",
+    "poe": "get_poe_status",
     "loopbacks": "get_loopbacks", "routed": "get_routed_ports",
     "svi": "get_vlan_interfaces", "lag": "get_lag",
 }
@@ -425,10 +426,12 @@ async def get_interfaces(device: "str | list[str]" = None, scope: str = "physica
     """Interface state. For MULTIPLE devices pass a COMMA-SEPARATED string
     (e.g. `device='Access-01,Access-02'`) or a list; `site` targets a whole site
     — all fan out in a SINGLE batched call. `scope`: physical | transceivers |
-    counters | supported_transceivers | loopbacks | routed | svi | lag.
-    `interface` filters physical/transceivers/counters; `lag` filters lag.
+    counters | supported_transceivers | poe | loopbacks | routed | svi | lag.
+    `interface` filters physical/transceivers/counters/poe; `lag` filters lag.
     `counters` returns rx/tx/error/drop traffic counters; `supported_transceivers`
-    lists the transceiver models the device supports."""
+    lists the transceiver models the device supports; `poe` returns per-port
+    Power-over-Ethernet draw (watts) plus the chassis-wide PoE power budget —
+    use it for site/switch/port electrical (PoE) consumption questions."""
     return await _read_dispatch("get_interfaces", _MAP_INTERFACES, scope, device,
                                 site, {"interface": interface, "lag": lag,
                                        **(params or {})}, source=source, limit=limit)
@@ -735,7 +738,7 @@ _DISPATCHERS: list[Callable] = [
 # Legacy atomic tools that stay advertised as-is (never de-advertised).
 _KEEP_ATOMIC: set[str] = {
     "list_devices", "list_sites", "get_logs", "run_ssh_commands",
-    "manage_config", "logout", "rollback",
+    "manage_config", "backup_config", "logout", "rollback",
 }
 
 

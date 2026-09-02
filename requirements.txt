@@ -1,6 +1,7 @@
 mcp>=1.0.0,<2.0.0
 aiohttp>=3.9.0
 asyncssh>=2.14.0
+tftpy>=0.8.6
 pyyaml>=6.0
 python-dotenv>=1.0.0
 starlette>=0.40.0

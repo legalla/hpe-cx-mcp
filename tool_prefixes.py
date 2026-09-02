@@ -80,6 +80,7 @@ DOMAINS: dict[str, list[str]] = {
     "interface": [
         "get_interfaces", "get_transceivers", "get_loopbacks",
         "get_interface_counters", "get_supported_transceivers",
+        "get_poe_status",
         "get_routed_ports", "get_vlan_interfaces", "get_lag",
         "configure_loopback", "configure_routed_port",
         "verify_loopback", "verify_routed_port",
@@ -125,7 +126,7 @@ DOMAINS: dict[str, list[str]] = {
     ],
     "config": [
         "list_configs", "compare_configs", "get_config",
-        "get_full_config", "manage_config",
+        "get_full_config", "manage_config", "backup_config",
     ],
     "service": [  # orchestrated provisioning
         "create_vlan_service", "delete_vlan_service",
