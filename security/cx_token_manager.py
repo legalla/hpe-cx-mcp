@@ -4,16 +4,16 @@
 Usage examples::
 
     # Generate a token for a named client (name is REQUIRED)
-    python cx_token_manager.py generate --name "vscode-dev" --description "Laptop VSCode"
+    python security/cx_token_manager.py generate --name "vscode-dev" --description "Laptop VSCode"
 
     # List existing tokens (values are masked)
-    python cx_token_manager.py list
+    python security/cx_token_manager.py list
 
     # Reveal a token value (recovery)
-    python cx_token_manager.py show --name "vscode-dev"
+    python security/cx_token_manager.py show --name "vscode-dev"
 
     # Revoke a token
-    python cx_token_manager.py revoke --name "vscode-dev"
+    python security/cx_token_manager.py revoke --name "vscode-dev"
 
 The tokens file location follows the ``CX_TOKENS_FILE`` environment variable
 (or ``--file``), defaulting to the same path the server reads. This script only
@@ -47,7 +47,7 @@ def _generate(args: argparse.Namespace) -> int:
             "\n🔄 This is the FIRST token. If authentication is enabled "
             "(CX_AUTH_ENABLED=true), the MCP services are currently LOCKED. "
             "Apply this token to the running server (no restart needed):\n"
-            "    docker compose exec cx-mcp python cx_reload.py\n"
+            "    docker compose exec cx-mcp python security/cx_reload.py\n"
             "  (or restart the container: docker compose restart cx-mcp)"
         )
     return 0

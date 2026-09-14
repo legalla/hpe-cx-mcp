@@ -25,7 +25,7 @@ services:
       # Set to "true" to require a valid Bearer token on every MCP request.
       # The server then REFUSES TO START if no valid token exists in the file.
       # Generate tokens inside the container with:
-      #   docker compose exec hpe-cx-mcp python cx_token_manager.py generate --name <client>
+      #   docker compose exec hpe-cx-mcp python security/cx_token_manager.py generate --name <client>
       CX_AUTH_ENABLED:        "true"
       CX_TOKENS_FILE:         /app/secrets/.tokens
       # CX_TRUST_FORWARDED_FOR: "false"   # set true only behind a trusted proxy

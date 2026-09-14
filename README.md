@@ -617,16 +617,16 @@ running container** with the bundled CLI:
 
 ```bash
 # Create a named token (prints the secret once — save it)
-docker compose exec hpe-cx-mcp python cx_token_manager.py generate --name vscode-dev
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py generate --name vscode-dev
 
 # List tokens (names, descriptions, created — secret truncated)
-docker compose exec hpe-cx-mcp python cx_token_manager.py list
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py list
 
 # Show one token
-docker compose exec hpe-cx-mcp python cx_token_manager.py show --name vscode-dev
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py show --name vscode-dev
 
 # Revoke a token
-docker compose exec hpe-cx-mcp python cx_token_manager.py revoke --name vscode-dev
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py revoke --name vscode-dev
 ```
 
 Generated tokens are prefixed `cx_`. Use one distinct token per client/agent to
@@ -636,7 +636,7 @@ get per-actor attribution in the audit log.
 > (HTTP 503 on every request) until a token exists. After creating the **first**
 > token, apply it without a restart by hot-reloading (see below):
 > ```bash
-> docker compose exec hpe-cx-mcp python cx_reload.py
+> docker compose exec hpe-cx-mcp python security/cx_reload.py
 > ```
 > (a `docker compose restart hpe-cx-mcp` also works).
 
@@ -647,7 +647,7 @@ Token and inventory files are loaded into memory at startup. After editing
 changes to the **running** server by sending it a reload signal:
 
 ```bash
-docker compose exec hpe-cx-mcp python cx_reload.py
+docker compose exec hpe-cx-mcp python security/cx_reload.py
 ```
 
 This reloads **both** the tokens and the inventory in place — adding/revoking a

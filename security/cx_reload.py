@@ -5,7 +5,7 @@ Sends ``SIGHUP`` to the server process so it reloads the **tokens** file and the
 **inventory** file in place, WITHOUT a container rebuild or restart. Run it
 inside the container:
 
-    docker compose exec cx-mcp python cx_reload.py
+    docker compose exec cx-mcp python security/cx_reload.py
 
 The reload is performed asynchronously by the server; this command only delivers
 the signal. The actual outcome (number of tokens / devices reloaded, or any

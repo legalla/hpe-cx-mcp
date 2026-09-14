@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 import aiohttp
 
-from config import (
+from .config import (
     DeviceConfig,
     Inventory,
     SourceConfig,

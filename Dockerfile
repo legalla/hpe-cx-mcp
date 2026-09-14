@@ -6,11 +6,22 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY aruba_client.py config.py config_backup.py inventory_sources.py server.py ssh_client.py cx_auth.py cx_audit.py cx_token_manager.py cx_reload.py deferred_tools.py tool_prefixes.py write_safety.py flat_tools.py ./
+COPY server.py ./
+COPY core/ ./core/
+COPY clients/ ./clients/
+COPY tools/ ./tools/
+COPY security/ ./security/
+COPY dispatch/ ./dispatch/
 RUN chown -R mcp:mcp /app
 
 USER mcp
 
 EXPOSE 8000
+
+# Any HTTP response (even an error status, e.g. missing session/auth) proves
+# Uvicorn/FastMCP is accepting connections; only a connection failure/timeout
+# means the process is stuck or down.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["python", "-c", "import sys,urllib.request,urllib.error\ntry:\n    urllib.request.urlopen('http://127.0.0.1:8000/mcp', timeout=3)\nexcept urllib.error.HTTPError:\n    pass\nexcept Exception:\n    sys.exit(1)"]
 
 ENTRYPOINT ["python", "server.py"]

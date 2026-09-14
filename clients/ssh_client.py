@@ -10,7 +10,9 @@ output read until the prompt returns.
 """
 
 import asyncio
+import json
 import logging
+import os
 import re
 
 import asyncssh
@@ -19,6 +21,70 @@ logger = logging.getLogger(__name__)
 
 # ANSI escape sequences (the vt100 terminal may emit them).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+# Trust-on-first-use SSH host-key store: {"host:port": "SHA256:..."}. Lives in
+# the same read-write secrets volume as the Bearer tokens (see cx_auth.py).
+_HOST_KEYS_FILE = os.environ.get("CX_SSH_KNOWN_HOSTS_FILE", "/app/secrets/ssh_known_hosts.json")
+
+
+def _load_host_keys(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("⚠️  SSH known-hosts store '%s' could not be parsed (%s).", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_host_keys(hosts: dict, path: str) -> None:
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(hosts, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+class _TofuSSHClient(asyncssh.SSHClient):
+    """Trust-on-first-use SSH host-key validation.
+
+    The first connection to a given ``host:port`` records the server's key
+    fingerprint; every later connection is compared against the stored
+    value, so a key that suddenly changes (device replaced/reimaged, or a
+    possible MITM) is rejected instead of silently accepted.
+    """
+
+    def __init__(self, host: str, port: int, store_path: str = _HOST_KEYS_FILE):
+        self._lookup_host = f"{host}:{port}"
+        self._store_path = store_path
+
+    def validate_host_public_key(self, host, addr, port, key) -> bool:
+        fingerprint = key.get_fingerprint("sha256")
+        hosts = _load_host_keys(self._store_path)
+        known = hosts.get(self._lookup_host)
+        if known is None:
+            hosts[self._lookup_host] = fingerprint
+            _save_host_keys(hosts, self._store_path)
+            logger.info("🔑 Trusting new SSH host key for %s (%s) — recorded for future checks.",
+                        self._lookup_host, fingerprint)
+            return True
+        if known != fingerprint:
+            logger.warning(
+                "🚫 SSH host key MISMATCH for %s: expected %s, got %s. Refusing to connect "
+                "(possible MITM, or the device's key legitimately changed — if so, remove "
+                "the '%s' entry from '%s' to re-trust it).",
+                self._lookup_host, known, fingerprint, self._lookup_host, self._store_path,
+            )
+            return False
+        return True
 
 # ArubaOS-CX prompt at the end of the buffer: 'switch#', 'switch>', 'switch(config)#'…
 _PROMPT_RE = re.compile(r"[\r\n][A-Za-z0-9._\-]+(\([A-Za-z0-9._\-]+\))?[#>]\s*$")
@@ -85,8 +151,12 @@ class ArubaOSCXSSHClient:
                         port=self.port,
                         username=self.username,
                         password=self.password,
-                        known_hosts=None,      # lab: no host-key verification
+                        # known_hosts=b'' (not None) so asyncssh still calls our
+                        # client's validate_host_public_key() below instead of
+                        # skipping host-key checking altogether.
+                        known_hosts=b"",
                         client_keys=None,      # password authentication only
+                        client_factory=lambda: _TofuSSHClient(self.host, self.port),
                     ),
                     timeout=self.timeout,
                 )

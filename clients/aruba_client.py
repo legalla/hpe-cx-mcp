@@ -1752,13 +1752,67 @@ class ArubaOSCXClient:
 
     # ─── Logs ────────────────────────────────────────────────────────────────
 
-    async def get_logs(self, limit: int = 50, priority: Optional[str] = None) -> dict:
-        params: dict = {"limit": min(limit, 1000)}
+    @staticmethod
+    def _format_log_entry(entity: dict) -> dict:
+        timestamp = None
+        ts_raw = entity.get("__REALTIME_TIMESTAMP")
+        if ts_raw:
+            try:
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts_raw) / 1_000_000))
+            except (ValueError, OverflowError):
+                timestamp = None
+        priority_raw = entity.get("PRIORITY")
+        try:
+            priority = int(priority_raw) if priority_raw is not None else None
+        except ValueError:
+            priority = priority_raw
+        return {
+            "timestamp": timestamp,
+            "priority": priority,
+            "daemon": entity.get("SYSLOG_IDENTIFIER", "N/A"),
+            "category": entity.get("OPS_EVENT_CATEGORY", "N/A"),
+            "event_id": entity.get("OPS_EVENT_ID", "N/A"),
+            "hostname": entity.get("_HOSTNAME", "N/A"),
+            "message": entity.get("MESSAGE", "N/A"),
+        }
+
+    async def get_logs(
+        self,
+        limit: int = 50,
+        priority: Optional[str] = None,
+        daemon: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+    ) -> dict:
+        # /logs/event (systemd-journal export) returns entries newest-first,
+        # so `limit` alone already yields the N MOST RECENT logs — there is
+        # no separate "sort"/"tail" param on this endpoint.
+        params: dict = {"limit": max(1, min(limit, 1000))}
         if priority:
             params["priority"] = priority
+        if daemon:
+            params["SYSLOG_IDENTIFIER"] = daemon
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
         data = await self._get("/logs/event", params=params)
-        logs = data if isinstance(data, list) else (data.get("result") or data.get("items") or []) if isinstance(data, dict) else []
-        return {"logs": logs, "count": len(logs)}
+        if isinstance(data, list):
+            entities = data
+        elif isinstance(data, dict):
+            # response key is "entities" (NOT "result"/"items" — old code
+            # looked for those and always got an empty list back).
+            entities = data.get("entities")
+            if entities is None:
+                entities = data.get("result") or data.get("items") or []
+        else:
+            entities = []
+        logs = [self._format_log_entry(e) if isinstance(e, dict) else e for e in entities]
+        total_matching = None
+        if isinstance(data, dict) and isinstance(data.get("entityCounts"), dict):
+            counts = data["entityCounts"]
+            total_matching = counts.get("filtered", counts.get("total"))
+        return {"logs": logs, "count": len(logs), "total_matching": total_matching}
 
     # ─── Spanning Tree ───────────────────────────────────────────────────────
 

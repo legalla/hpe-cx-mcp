@@ -56,12 +56,12 @@ log = logging.getLogger("cx-mcp.deferred")
 # Optional sibling modules (present in the same package). Imported defensively
 # so this module keeps working even if they are absent.
 try:  # functional-prefix layer (advertised-name aliasing)
-    import tool_prefixes as _tp
+    from . import tool_prefixes as _tp
 except Exception:  # pragma: no cover
     _tp = None
 
 try:  # dry_run_token + rollback_id layer
-    from write_safety import write_safety as _ws
+    from .write_safety import write_safety as _ws
 except Exception:  # pragma: no cover
     _ws = None
 
