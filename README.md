@@ -48,6 +48,7 @@ platform notes are in [§3](#3-installation-macos--linux--windows).
 7. [Security: Bearer auth & audit logging](#7-security-bearer-auth--audit-logging)
 8. [Token management](#8-token-management)
 9. [Connecting an MCP client](#9-connecting-an-mcp-client)
+10. [Prompts (guided operations) & skills](#10-prompts-guided-operations--skills)
 
 ---
 
@@ -692,3 +693,62 @@ Example (VS Code `mcp.json` style):
   }
 }
 ```
+
+---
+
+## 10. Prompts (guided operations) & skills
+
+### Prompts
+
+Beyond individual tools, the server exposes **MCP prompts** (`tools/prompts.py`)
+— reusable, multi-step operation guides an agent can follow end-to-end instead
+of being told which tool to call at each step. Each prompt returns a short plan
+referencing the tools/dispatchers above; the agent still asks for confirmation
+before any `apply`-mode write.
+
+**Data Center**
+| Prompt | Purpose |
+|--------|---------|
+| `fabric_health_check(site)` | Site-wide fabric health: system/interfaces/vlans/logs, VXLAN tunnels, EVPN routes, VSX sync, underlay BGP. |
+| `provision_vlan_service_guide(device, vlan_id)` | Guided plan → apply → verify walkthrough of `configure_service` (VLAN/L2VNI/EVPN RT/SVI). |
+| `verify_vsx_pair(device_a, device_b)` | Cross-check both VSX peers for role/sync/keepalive consistency. |
+| `capacity_and_license_review(device)` | Hardware scale-limit utilization, feature-pack licensing state, container review. |
+
+**Campus**
+| Prompt | Purpose |
+|--------|---------|
+| `rollout_8021x_guide(device, interfaces)` | Guided 802.1X/MAC-Auth rollout: RADIUS/TACACS+ reachability check, then plan → apply → verify. |
+| `poe_budget_check(device)` | PoE power budget audit (per-port draw + chassis-wide budget). |
+| `campus_topology_audit(site)` | Site-wide LLDP-based topology mapping and cabling/loop anomaly detection. |
+| `guest_network_audit(device)` | Review guest/BYOD role, GBP/ABP and policy bindings for over-broad access. |
+
+**Cross-domain (DC + Campus)**
+| Prompt | Purpose |
+|--------|---------|
+| `diagnostic_equipement(device)` | Full health check of a single switch (system, interfaces, VLANs, logs). |
+| `troubleshoot_routing(device, vrf)` | Diagnose BGP + OSPF (neighbor state, route table). |
+| `troubleshoot_client_8021x(device, interface)` | Troubleshoot a client that can't authenticate (802.1X/MAC-Auth). |
+| `verifier_evpn_vxlan(device)` | Check EVPN/VXLAN overlay health on one switch. |
+| `localiser_client(device, mac)` | Locate a MAC/client (MAC table, ARP, LLDP, port-access). |
+| `audit_configuration(device)` | Configuration + AAA audit against best practices. |
+| `hardening_compliance_check(device)` | Audit against the official **AOS-CX 10.17 Hardening Guide** (see the matching skill below). |
+| `pre_change_safety_guide(device)` | Checkpoint → change → diff → restore-if-needed safety workflow. |
+| `spanning_tree_loop_check(site)` | Site-wide STP state cross-referenced with LLDP to spot loops/instability. |
+
+### Skills
+
+`skills/` holds installable `SKILL.md` domain-knowledge packages (playbooks,
+gotchas, thresholds) that complement the prompts above:
+
+| Skill | Covers |
+|-------|--------|
+| `aoscx-hardening-compliance` | Full control-domain checklist from the official AOS-CX 10.17 Hardening Guide (mgmt access, AAA, SSH, SNMP, NTP, PKI, CoPP, L2 hardening, routing-protocol security, multicast, NAE scripts). |
+| `aoscx-dc-fabric-ops` | EVPN/VXLAN tunnel-down triage, VSX split-brain/config-sync diagnosis. |
+| `aoscx-campus-nac-ops` | 802.1X/MAC-Auth rollout checklist and client-authentication troubleshooting. |
+| `aoscx-change-management` | Checkpoint/diff/restore workflow, PUT-replaces-wholesale gotcha, auto-checkpoint safety net. |
+| `aoscx-capacity-planning` | Capacity/feature-pack/PoE-budget thresholds and what counts as a real gap. |
+| `aoscx-inventory-targeting` | Efficient `device`/`site`/`source` batching, the "device serialized as a string" client gotcha, envelope shape. |
+
+Each skill is a self-contained `SKILL.md` (YAML frontmatter `name`+`description`
+plus a Markdown body) — install/copy it into your assistant's skills directory
+to load the domain knowledge alongside this MCP server's tools.
