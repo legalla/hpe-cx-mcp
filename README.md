@@ -32,7 +32,7 @@ docker compose logs -f hpe-cx-mcp    # wait for "✅ hpe-cx-mcp server is up and
 ```
 
 The MCP endpoint is then available at **`http://<docker-host>:8002/mcp`**. Point
-your MCP client at it (see [§9](#9-connecting-an-mcp-client)). Full details and
+your MCP client at it (see [§10](#10-connecting-an-mcp-client)). Full details and
 platform notes are in [§3](#3-installation-macos--linux--windows).
 
 ---
@@ -47,8 +47,9 @@ platform notes are in [§3](#3-installation-macos--linux--windows).
 6. [Inventory management](#6-inventory-management)
 7. [Security: Bearer auth & audit logging](#7-security-bearer-auth--audit-logging)
 8. [Token management](#8-token-management)
-9. [Connecting an MCP client](#9-connecting-an-mcp-client)
-10. [Prompts (guided operations) & skills](#10-prompts-guided-operations--skills)
+9. [Operations runbook](#9-operations-runbook)
+10. [Connecting an MCP client](#10-connecting-an-mcp-client)
+11. [Prompts (guided operations) & skills](#11-prompts-guided-operations--skills)
 
 ---
 
@@ -58,9 +59,14 @@ platform notes are in [§3](#3-installation-macos--linux--windows).
 - **Read (observe)**: interfaces, VLANs, routing/ARP/MAC tables, BGP/OSPF/EVPN,
   VXLAN tunnels, VSX/VSF stack state, hardware health, logs, 802.1X / port-access,
   NAE scripts, application recognition (ARC), full configs.
-- **Write (configure)**: VLAN services, loopbacks, routed ports, VRFs, BGP, OSPF,
-  EVPN/VXLAN, port authentication, virtual-MAC, ARC — each paired with a
-  **`verify_*`** read-back tool.
+- **Write (configure)**: VLAN services, VLANs/SVIs/trunks, LAGs (static, LACP,
+  MC-LAG, EVPN multihoming), loopbacks, routed ports, VRFs, static routes,
+  BGP, OSPF, redistribution, EVPN/VXLAN, VSX, DHCP relay, port groups,
+  port authentication, virtual-MAC, ARC — each paired with a **`verify_*`**
+  read-back tool.
+- **Orchestrate**: multi-step workflows (VSX pair, L3 links, access ports,
+  RADIUS/802.1X, VXLAN overlay and VLAN services, full fabric underlay/overlay)
+  in one plan → apply call, with a per-device checkpoint.
 - **Safety rails**:
   - Per-device **`access_mode`** (`read-only` by default; writes are denied unless
     a device is explicitly `read-write`).
@@ -163,6 +169,41 @@ Each `configure_*` tool has a matching `verify_*` read-back tool:
 | `configure_port_auth` | `verify_port_auth` | 802.1X / MAC-Auth |
 | `configure_app_recognition` | `verify_app_recognition` | ARC |
 | `configure_virtual_mac` | `verify_virtual_mac` | Global EVPN virtual-MAC |
+| `configure_vlan` | `verify_vlan` | VLAN(s), single or batch (`vlans=[…]`) |
+| `configure_svi` | `verify_svi` | SVI + active-gateway |
+| `configure_trunk` | `verify_trunk` | Trunk port allowed / native VLANs |
+| `configure_lag` | `verify_lag` | LAG: static, LACP, MC-LAG (VSX), EVPN multihoming (ESI) |
+| `configure_interface_admin` | `verify_interface_admin` | Port admin up/down |
+| `configure_interface_group` | `verify_interface_group` | Port-group speed (`system interface-group`) |
+| `configure_dhcp_relay` | `verify_dhcp_relay` | DHCP relay (IP helper) per interface/VRF |
+| `configure_hostname` | `verify_hostname` | Hostname (single or batch) |
+| `configure_static_route` | `verify_static_route` | Static routes + next-hops |
+| `configure_redistribute` | `verify_redistribute` | BGP/OSPF redistribution |
+| `configure_vsx` | `verify_vsx` | VSX pairing (asymmetric per peer) |
+| `configure_aaa` / `configure_user_roles` | `verify_aaa` / `verify_user_roles` | AAA, local user roles |
+
+### Orchestrators (multi-step writes)
+Each orchestrator builds one ordered step list per device, runs it inside a
+single auto-checkpoint and stops at the first failing step (the switch then
+reverts). Plan mode shows every step and, for the fabric tools, the IP
+allocation, without writing anything.
+
+| Orchestrator | Verify | Does |
+|--------------|--------|------|
+| `orchestrate_vsx_pair` | `verify_vsx_cluster` | Keepalive VRF/port, ISL LAG, VSX pairing (or full teardown with `delete=true`). |
+| `orchestrate_l3_link` | `verify_routed_port` | Routed P2P link(s) + optional VRF/OSPF; batch with `links=[…]`. |
+| `orchestrate_access_port` | `verify_access_port` | L2 access port(s) + STP guards + 802.1X. |
+| `orchestrate_radius_dot1x` | `verify_radius_dot1x` | RADIUS servers/group + global AAA + per-port 802.1X. |
+| `orchestrate_overlay` | `verify_overlay` | Device-level VTEP: VXLAN interface, global EVPN, virtual-MAC, optional BGP-EVPN (`mode` = `evpn`/`stub`/`static`). |
+| `orchestrate_overlay_service` | `verify_overlay_service` | Batch of VLAN → L2VNI → EVPN RT and/or static peers (`attach` = `evpn`/`static`/`stub`). |
+| `orchestrate_evpn_vlan` / `orchestrate_static_vxlan` | `verify_evpn_vlan` / `verify_static_vxlan` | Legacy single-service variants (prefer `overlay_service`). |
+| `orchestrate_fabric_underlay` | — | Whole fabric underlay: loopback0/1 and /31 P2P addressing from pools, OSPF P2P, cabling from LLDP or explicit. |
+| `orchestrate_fabric_overlay` | — | Whole iBGP-EVPN control plane (spines as route reflectors), VXLAN interface and virtual-MAC on every leaf. |
+
+Per-device values (`ip_address`, `source_ip`, `virtual_mac`, `router_id`) accept
+a `{device: value}` mapping or `loopback0`/`auto`. A shared literal is refused
+unless the devices sharing it are one VSX pair. VSF secondary members are refused
+as targets (address the conductor instead).
 
 > **Write protection**: a `configure_*` / `create_*` / `delete_*` / `manage_config`
 > call on a `read-only` device is refused. Mark the device `access_mode: read-write`
@@ -173,9 +214,9 @@ Each `configure_*` tool has a matching `verify_*` read-back tool:
 The server can expose its capabilities in two **mutually exclusive** ways, chosen
 by the `CX_FLAT_TOOLSET` flag (see [§5](#5-environment-variables)):
 
-**Flat toolset (`CX_FLAT_TOOLSET=true` — the default).** The ~101 atomic tools
-listed above are collapsed into **17 flat dispatchers** (plus the 8 kept-atomic
-tools below — 25 tools advertised in total) driven by a `scope` (and, for
+**Flat toolset (`CX_FLAT_TOOLSET=true` — the default).** The atomic tools
+listed above are collapsed into **19 flat dispatchers** (plus the 10 kept-atomic
+tools below — 29 tools advertised in total) driven by a `scope` (and, for
 writes, an `action`) argument. The underlying REST client code is
 unchanged — the dispatchers only *route* to it, so there is no behavioural
 regression. Every read dispatcher also accepts **`device: str | list`**, **`site`**
@@ -185,10 +226,10 @@ parallel, returning one envelope `{scope, results, errors, summary}`. An optiona
 
 | Dispatcher | `scope` values |
 |------------|----------------|
-| `get_system` | `info`, `inventory`, `environment`, `capacity`, `boot`, `maintenance`, `containers`, `feature_pack`, `central`, `ssh` |
-| `get_interfaces` | `physical`, `transceivers`, `loopbacks`, `routed`, `svi`, `lag`, `poe` |
+| `get_system` | `info`, `environment`, `capacity`, `boot`, `maintenance`, `containers`, `feature_pack`, `central`, `ssh`, `supported_transceivers` |
+| `get_interfaces` | `physical` (incl. `l1_state` / down reason), `transceivers`, `counters`, `supported_transceivers`, `poe`, `loopbacks`, `routed`, `svi`, `lag`, `dhcp_relay`, `interface_group` |
 | `get_switching` | `vlans`, `mac`, `lldp`, `spanning_tree` |
-| `get_routing` | `bgp_summary`, `bgp_neighbors`, `bgp_config`, `bgp_routes`, `ospf_overview`, `ospf_neighbors`, `ospf_interfaces`, `route_table`, `arp` |
+| `get_routing` | `bgp_summary`, `bgp_neighbors`, `bgp_config`, `bgp_routes`, `neighbor_routes`, `ospf_overview`, `ospf_neighbors`, `ospf_interfaces`, `route_table`, `arp` |
 | `get_overlay` | `evpn_config`, `evpn_routes`, `evpn_multihoming`, `vtep_neighbors`, `vxlan_config`, `vxlan_tunnels`, `vxlan_static_peers` |
 | `get_redundancy` | `vsx_status`, `vsx_config`, `vsx_sync`, `vsf_status`, `vsf_config` |
 | `get_access` | `clients`, `client_detail`, `auth_config`, `summary`, `roles`, `gbp`, `gbp_maps`, `abp`, `policies`, `radius`, `tacacs`, `authentication`, `accounting` |
@@ -196,15 +237,19 @@ parallel, returning one envelope `{scope, results, errors, summary}`. An optiona
 | `get_apps` | `recognition`, `visibility` |
 | `get_config` | `running`, `startup`, `full`, `list`, `compare`, `raw` |
 | `manage_inventory` | `sources`, `resolve`, `refresh`, `find` |
-| `configure_interface` | `loopback`, `routed_port`, `vxlan`, `virtual_mac` — `action`: `plan`/`apply`/`verify` |
-| `configure_routing` | `ospf`, `bgp`, `vrf`, `evpn` — `action`: `plan`/`apply`/`verify` |
-| `configure_security` | `port_auth`, `aaa`, `user_roles`, `app_recognition` — `action`: `plan`/`apply`/`verify` |
+| `configure_interface` | `loopback`, `routed_port`, `lag`, `vxlan`, `virtual_mac`, `vlan`, `svi`, `trunk`, `admin`, `dhcp_relay`, `interface_group`, `hostname`, `l3_link`, `access_port`, `static_vxlan`, `overlay`, `overlay_service` — `action`: `plan`/`apply`/`verify` |
+| `configure_routing` | `ospf`, `bgp`, `vrf`, `evpn`, `static_route`, `redistribute`, `evpn_vlan` — `action`: `plan`/`apply`/`verify` |
+| `configure_security` | `port_auth`, `aaa`, `user_roles`, `app_recognition`, `radius_dot1x` — `action`: `plan`/`apply`/`verify` |
+| `configure_redundancy` | `vsx`, `vsx_pair` — `action`: `plan`/`apply`/`verify` |
 | `configure_service` | `vlan` — `action`: `plan`/`apply`/`delete`/`delete_plan`/`verify` |
+| `orchestrator` | `name`: `vsx_pair`, `l3_link`, `access_port`, `static_vxlan`, `evpn_vlan`, `radius_dot1x`, `overlay`, `overlay_service` — same orchestrators as the scopes above, one entry point |
 | `diagnose` | `device`, `evpn`, `client` (deterministic multi-check bundle) |
 | `troubleshoot` | omit `feature_name` to list supported features/components; pass it to run (`choice`: `basic-health`/`config`/`health`/`operations`/`detailed`) — AOS-CX 10.18+ |
 
-Plus 8 kept-atomic tools: `list_devices`, `list_sites`, `get_logs`,
-`run_ssh_commands`, `manage_config`, `backup_config`, `logout`, `rollback`. Write dispatchers keep
+Plus 10 kept-atomic tools: `list_devices`, `list_sites`, `get_logs`,
+`run_ssh_commands`, `manage_config`, `backup_config`, `logout`, `rollback`,
+`orchestrate_fabric_underlay`, `orchestrate_fabric_overlay` (these two take
+`spines`/`leafs` lists instead of a single `device`). Write dispatchers keep
 the **plan → apply → verify** lifecycle and the per-device read-only guard. Domain
 fields are passed in a `params` object (keys documented in each dispatcher's
 docstring).
@@ -250,9 +295,17 @@ Domains: `inventory`, `exec`, `system`, `interface`, `switching`, `routing`,
 Workflow: call any write tool with `apply=false` (the default) to get a plan **and**
 a `dry_run_token`; then call `apply_plan(dry_run_token=…)` to apply that exact plan.
 Idempotent `configure_*` merges have no automatic inverse and are reported as
-`unsupported` by `rollback`. When `CX_REQUIRE_DRY_RUN_TOKEN=true`, a direct apply
-(`apply=true`) through `invoke_tool` is refused — callers must go through the
-preview→`apply_plan` path.
+`unsupported` by `rollback`. When `CX_REQUIRE_DRY_RUN_TOKEN=true` (the shipped
+default), a direct apply is refused on **every** write path:
+
+- **Flat toolset** (`configure_interface` / `configure_routing` /
+  `configure_security` / `configure_service`): `action=plan` returns a
+  `dry_run_token`; `action=apply` (or `delete`) must pass `dry_run_token=…`
+  with the same `params`. The plan is re-computed and hash-compared before the
+  write (TOCTOU guard), the token is single-use, and a `rollback_id` is
+  attached when the plan is reversible.
+- **Legacy layer**: `apply=true` through `invoke_tool` is refused — use the
+  preview→`apply_plan` path.
 
 ---
 
@@ -445,32 +498,47 @@ content. The default filename is `{hostname}_{timestamp}_config.cfg`; pass
 `filename_format` to change it. Only `{hostname}` and UTC `{timestamp}`
 (`YYYYMMDDTHHMMSSZ`) are permitted.
 
-### Bearer authentication (optional, OFF by default)
+### TLS verification towards the switches
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CX_AUTH_ENABLED` | `false` | Require a valid Bearer token on every request. **If enabled with no token yet, the server starts in LOCKED mode and refuses every MCP request with HTTP 503 until you create the first token and restart.** |
+| `ARUBA_VERIFY_SSL` | `true` | Default `verify_ssl` for every device and inventory source. Inventory `defaults.verify_ssl` / per-device `verify_ssl` override it. Keep `true` in production; opt out per lab inventory, not globally. |
+| `ARUBA_CA_BUNDLE` | `/app/certs/ca-bundle.pem` | PEM chain of the internal CA that signed the switch certificates (mount `./certs:/app/certs:ro`). Falls back to the system trust store when the file is absent. |
+
+### Bearer authentication (ON in the shipped compose)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CX_AUTH_ENABLED` | `false` | Require a valid Bearer token on every request. **If enabled with no token yet, the server starts in LOCKED mode and refuses every MCP request with HTTP 503 until you create the first token and hot-reload (`security/cx_reload.py`).** Issue **one token per client**; revoke on off-boarding. |
 | `CX_TOKENS_FILE` | `/app/secrets/.tokens` | Token store path. |
 | `CX_TRUST_FORWARDED_FOR` | `false` | Trust `X-Forwarded-For` (first hop) for client IP. Set `true` **only** behind a trusted reverse proxy. |
 
-### Audit logging (optional, OFF by default)
+### Audit logging (ON in the shipped compose, `writes`)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CX_AUDIT_ENABLED` | `false` | Emit a JSON record per tool call. |
-| `CX_AUDIT_FILE` | `/app/logs/audit.jsonl` | Output file (rotating, 10 MB × 5). |
+| `CX_AUDIT_FILE` | `/app/logs/audit.jsonl` | Output file (rotating, 10 MB × 5) on the `./logs` volume. |
 | `CX_AUDIT_LEVEL` | `all` | `all` = every call; `writes` = only state-changing tools. |
-| `CX_AUDIT_STDOUT` | `false` | Also mirror records to stdout (`docker logs`). |
+| `CX_AUDIT_STDOUT` | `false` | Also mirror records to stdout so the Docker logging driver can ship them (Loki/SIEM). |
 
 ### Progressive disclosure, prefixes & write safety (optional)
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CX_FLAT_TOOLSET` | `true` | Collapse the ~101 atomic tools into 17 flat `scope`/`action` dispatchers (25 tools advertised total, incl. 8 kept-atomic). Takes precedence: when on, the three layers below are skipped. Set `false` to opt back into the legacy atomic tools. |
+| `CX_FLAT_TOOLSET` | `true` | Collapse the atomic tools into 19 flat `scope`/`action` dispatchers (29 tools advertised total, incl. 10 kept-atomic). Takes precedence: when on, the three layers below are skipped. Set `false` to opt back into the legacy atomic tools. |
 | `CX_DEFERRED_TOOLS` | `false` | (Legacy mode only) Advertise only Tier-1 tools; reach the rest via `search_tools` / `invoke_tool`. |
 | `CX_TOOL_PREFIXES` | `false` | (Legacy mode only) Rename advertised tools `<domain>__<tool>` (e.g. `routing__get_bgp_neighbors`). |
 | `CX_INVOKE_WRITES` | `true` | Allow write tools to run through `invoke_tool`. |
 | `CX_WRITE_SAFETY` | `false` | Enable the `dry_run_token` preview + `apply_plan` / `rollback` meta-tools. |
-| `CX_REQUIRE_DRY_RUN_TOKEN` | `false` | Refuse a direct `apply=true` via `invoke_tool`; force the preview → `apply_plan` path. |
+| `CX_REQUIRE_DRY_RUN_TOKEN` | `false` | Refuse any apply without a valid `dry_run_token` (flat `configure_*` dispatchers **and** `invoke_tool`); force the plan → apply path. The shipped compose sets it to `true`. |
 | `CX_DRY_RUN_TTL` | `900` | Lifetime (seconds) of a `dry_run_token`. |
+| `CX_TOKEN_SESSION_BOUND` | `false` | A token is bound to (operation, plan hash, TTL), not to a caller. `true` also refuses a token issued by another MCP session; `false` only reports it (`dry_run_token_origin` + warning). |
 | `CX_SECRETS_DIR` | `<app>/secrets` | Directory for the write-safety stores (`.dry_run_plans.json`, `.rollback_journal.json`). Set to a writable, mounted dir (e.g. `/app/logs`). |
+
+### Apply-time safety rails
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CX_AUTO_CHECKPOINT` | `true` | Wrap every `configure_*` apply in a firmware auto-checkpoint (confirmed commit): armed before the write, confirmed on success. A failed/interrupted apply is reverted by the switch after the timer. Set `false` to disable globally; each call can override with `auto_checkpoint=true|false`. |
+| `CX_AUTO_CHECKPOINT_MINUTES` | `10` | Auto-checkpoint timer (1-60). |
+| `CX_PROTECTED_OBJECTS` | *(empty)* | Comma-separated fnmatch globs on the URL-decoded REST path; matching resources refuse PUT/DELETE unless the call passes `force=true`. E.g. `/system/vrfs/mgmt,*/bgp_neighbors/spine-RR,/system/interfaces/lag*`. |
+| `CX_VERSION` | from `VERSION` | Build/runtime version reported by `/healthz` and the image label. |
 
 ---
 
@@ -493,7 +561,7 @@ defaults:
   username: admin
   password: "secret"
   api_version: latest        # auto-detect the newest REST version
-  verify_ssl: false
+  verify_ssl: false          # lab only (self-signed certs); default is true
   timeout: 30
   access_mode: read-only     # writes denied unless overridden per device
 
@@ -668,7 +736,94 @@ Reloading is **manual** and explicit — there is no automatic file watching.
 
 ---
 
-## 9. Connecting an MCP client
+## 9. Operations runbook
+
+Day-2 procedures for a production deployment. Every command runs from the
+`cx-mcp/` directory on the Docker host.
+
+### 9.1 Health & version
+```bash
+curl -s http://localhost:8002/healthz | jq        # 200 ok/degraded, 503 unavailable
+docker inspect --format '{{.State.Health.Status}}' hpe-cx-mcp
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' hpe-cx-mcp
+```
+`/healthz` needs no token and never returns secrets. `problems[]` names the
+cause (`locked`, `inventory: 0 devices`, `inventory reload failed`). It is what
+the Docker `HEALTHCHECK` and any load balancer should probe.
+
+### 9.2 Upgrade / rollback of the server
+```bash
+# upgrade: bump ./VERSION, add a CHANGELOG entry, then
+export CX_VERSION=$(cat VERSION) && docker compose up -d --build
+# rollback: re-run with the previous, still-present image tag
+CX_VERSION=1.0.0 docker compose up -d --no-build
+```
+Images are tagged `hpe-cx-mcp:<version>` (never `latest`). After any rebuild,
+MCP clients must **reconnect** (tool schemas are cached client-side).
+
+### 9.3 Token lifecycle (one token per client)
+```bash
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py generate --name <client>
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py list
+docker compose exec hpe-cx-mcp python security/cx_token_manager.py revoke --name <client>
+docker compose exec hpe-cx-mcp python security/cx_reload.py   # apply without restart
+```
+Rotate: generate the new token, hand it over, revoke the old one, reload.
+If `/healthz` reports `locked`, no token exists: generate one and reload.
+
+### 9.4 Inventory change
+Edit `inventory/inventory.yaml`, then `python security/cx_reload.py` (as above).
+A syntax/schema error keeps the **previous** inventory in memory and is
+reported in `/healthz` → `inventory.last_error` and the logs. Fix and reload.
+
+### 9.5 Applying a change safely (what the agent goes through)
+1. `configure_*(action='plan', …)` → plan + `dry_run_token` (TTL `CX_DRY_RUN_TTL`).
+2. `configure_*(action='apply', dry_run_token=…, same params)` → the plan is
+   recomputed and hash-compared; the write runs inside a firmware
+   **auto-checkpoint**; on success the checkpoint is confirmed and a
+   `rollback_id` is returned.
+3. Protected objects (`CX_PROTECTED_OBJECTS`) are refused unless `force=true`.
+
+If an apply fails mid-way the response says *auto-checkpoint left ARMED*: the
+switch reverts by itself after `CX_AUTO_CHECKPOINT_MINUTES`. To keep the partial
+state instead, call `manage_config(device, action='confirm')` before the
+deadline. The safety net is on by default; disable it globally with
+`CX_AUTO_CHECKPOINT=false`, or for one call with `auto_checkpoint=false`
+(the per-device result then reports `checkpoint: disabled`).
+
+### 9.6 Undoing a change
+```text
+rollback(rollback_id='rb_…')                       # objects CREATED by the apply
+manage_config(device, action='list_checkpoints')   # otherwise: firmware checkpoints
+manage_config(device, action='restore_checkpoint', name='<checkpoint>')
+```
+`rollback` only removes objects the apply created (VLAN-service steps,
+loopbacks, VRFs, L3 VNIs). Updates of pre-existing objects are listed as
+`unsupported` — restore a checkpoint (or `startup-config`) for those.
+
+### 9.7 Reading the audit trail
+```bash
+tail -f logs/audit.jsonl | jq '{ts,actor,src_ip,tool,category,outcome,duration_ms}'
+jq -c 'select(.category=="write" and .outcome!="completed")' logs/audit.jsonl
+docker compose logs -f hpe-cx-mcp | grep '"tool"'      # same records on stdout
+```
+One JSON line per call (`CX_AUDIT_LEVEL=writes` → writes only); `actor` is the
+token name, `arguments` are redacted. Files rotate 10 MB × 5 under `./logs`.
+
+### 9.8 Incident checklist
+| Symptom | Check | Action |
+|---|---|---|
+| Clients get 401 | `/healthz` → `auth.tokens` | Token revoked/typo → issue a new one (§9.3). |
+| Clients get 503 | `/healthz` → `problems` | `locked` → create a token; `0 devices` → fix inventory + reload. |
+| Tool returns `dry_run_token required` | — | Expected: run `action='plan'` first. |
+| `matches protected object pattern` | `CX_PROTECTED_OBJECTS` | Intentional guard; re-run with `force=true` only after review. |
+| `auto-checkpoint could not be armed` | pending checkpoint on the switch | `manage_config(action='confirm')` on the device, or `CX_AUTO_CHECKPOINT=false` (not recommended). |
+| Stale MCP session / 404 after rebuild | container logs | Disconnect → Connect the MCP server in the client. |
+| Switch unreachable / TLS error | `verify_ssl`, `ARUBA_CA_BUNDLE` | Mount the CA chain in `./certs`, or set `verify_ssl: false` for that lab device only. |
+
+---
+
+## 10. Connecting an MCP client
 
 Point your MCP client at the streamable-HTTP endpoint:
 
@@ -696,7 +851,7 @@ Example (VS Code `mcp.json` style):
 
 ---
 
-## 10. Prompts (guided operations) & skills
+## 11. Prompts (guided operations) & skills
 
 ### Prompts
 
@@ -748,6 +903,7 @@ gotchas, thresholds) that complement the prompts above:
 | `aoscx-change-management` | Checkpoint/diff/restore workflow, PUT-replaces-wholesale gotcha, auto-checkpoint safety net. |
 | `aoscx-capacity-planning` | Capacity/feature-pack/PoE-budget thresholds and what counts as a real gap. |
 | `aoscx-inventory-targeting` | Efficient `device`/`site`/`source` batching, the "device serialized as a string" client gotcha, envelope shape. |
+| `aoscx-legacy-to-fabric-migration` | Safety-gated migration of a legacy network (VSX core, LAGs, VLANs, static routes) to a VXLAN-EVPN fabric (OSPF underlay, BGP-EVPN with spine RRs) using the orchestrators. |
 
 Each skill is a self-contained `SKILL.md` (YAML frontmatter `name`+`description`
 plus a Markdown body) — install/copy it into your assistant's skills directory

@@ -138,6 +138,7 @@ class FrozenPlan:
     ttl: float
     consumed: bool = False
     recipe: Optional[dict] = None  # {"tool": <name>, "arguments": {...}} for replay
+    issued_by: Optional[str] = None  # MCP session that ran the preview (None = unknown)
 
     def expired(self, now: Optional[float] = None) -> bool:
         return (now or time.time()) > self.created_at + self.ttl
@@ -166,13 +167,15 @@ class PlanStore:
     def freeze(self, operation: str, targets: list, plan: Any,
                *, ttl: float = _DEFAULT_TTL,
                state_fingerprint: Optional[str] = None,
-               recipe: Optional[dict] = None) -> str:
+               recipe: Optional[dict] = None,
+               issued_by: Optional[str] = None) -> str:
         token = "dr_" + uuid.uuid4().hex[:24]
         fp = FrozenPlan(
             token=token, operation=operation, targets=list(targets),
             plan_hash=plan_hash(plan, operation),
             state_fingerprint=state_fingerprint,
             created_at=time.time(), ttl=float(ttl), recipe=recipe,
+            issued_by=issued_by,
         )
         with self._lock:
             self._purge_locked()
@@ -208,6 +211,16 @@ class PlanStore:
                 fp.consumed = True
                 self._flush()
 
+    def unconsume(self, token: str) -> bool:
+        """Make a consumed (not expired) token usable again."""
+        with self._lock:
+            fp = self._plans.get(token)
+            if fp is None or fp.expired():
+                return False
+            fp.consumed = False
+            self._flush()
+            return True
+
     def get(self, token: str) -> Optional[FrozenPlan]:
         return self._plans.get(token)
 
@@ -234,6 +247,12 @@ INVERSE_ACTION_MAP: dict[str, str] = {
     "set_evpn_vlan_rt": "delete_evpn_vlan_rt",
     "create_svi": "delete_svi",
     "add_vlan_to_trunk": "remove_vlan_from_trunk",
+    # configure_* domains: only objects reported as status="created" by the
+    # executor (see tools_configure._created_actions) — updates of pre-existing
+    # objects have no automatic inverse.
+    "create_loopback": "delete_interface",
+    "create_l3vni": "delete_vni",
+    "ensure_vrf": "delete_vrf",
 }
 
 
@@ -425,17 +444,35 @@ class WriteSafety:
     def consume(self, token: str) -> None:
         self.plans.consume(token)
 
+    def token_origin(self, token: str, caller: Optional[str]) -> dict:
+        """Where a token came from relative to the applying caller. Validation
+        binds a token to (operation, plan hash, TTL) — not to a caller — so a
+        token from ANOTHER session is accepted when the plan is identical;
+        this makes that visible (and refusable with CX_TOKEN_SESSION_BOUND)."""
+        fp = self.plans.get(token)
+        if fp is None:
+            return {}
+        same = None if (fp.issued_by is None or caller is None) else fp.issued_by == caller
+        return {"age_s": int(time.time() - fp.created_at), "same_session": same}
+
+    def restore_token(self, token: str) -> bool:
+        """Give back a token whose apply wrote nothing, so the same plan can be
+        re-applied (the plan hash is re-checked against a fresh preview)."""
+        return self.enabled and self.plans.unconsume(token)
+
     # -- dry_run_token --------------------------------------------------
     def freeze(self, planned_response: dict, operation: str, targets: list,
                plan: Any, *, ttl: float = _DEFAULT_TTL,
-               state_fingerprint: Optional[str] = None) -> dict:
+               state_fingerprint: Optional[str] = None,
+               issued_by: Optional[str] = None) -> dict:
         """Augment a ``status=planned`` response with a dry_run_token.
 
         No-op when disabled (returns the response unchanged)."""
         if not self.enabled:
             return planned_response
         token = self.plans.freeze(operation, targets, plan, ttl=ttl,
-                                  state_fingerprint=state_fingerprint)
+                                  state_fingerprint=state_fingerprint,
+                                  issued_by=issued_by)
         planned_response["dry_run_token"] = token
         planned_response["token_expires_in"] = int(ttl)
         planned_response["note"] = (planned_response.get("note", "") +

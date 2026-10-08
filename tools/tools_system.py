@@ -160,12 +160,14 @@ async def get_loopbacks(device: str) -> dict:
 
 
 @mcp.tool()
-async def get_routed_ports(device: str) -> dict:
+async def get_routed_ports(device: str, include_unconfigured: bool = False) -> dict:
     """List the routed (L3) ports: physical/LAG/sub-interfaces with routing
-    enabled (point-to-point uplinks, L3 links). Excludes L2 switched ports,
-    VLAN SVIs and loopbacks."""
+    enabled AND an IP address or a non-default VRF (point-to-point uplinks, L3
+    links). Excludes L2 switched ports, VLAN SVIs and loopbacks.
+    `include_unconfigured=true` also lists ports that are only routing-capable
+    by default (e.g. every port of an 8360) without any L3 configuration."""
     async with _get_client(device) as client:
-        return await client.get_routed_ports()
+        return await client.get_routed_ports(include_unconfigured=include_unconfigured)
 
 
 @mcp.tool()

@@ -35,6 +35,7 @@ from .config import (
     VaultConfig,
     LOCAL_SOURCE,
     build_device_from_source,
+    ssl_setting,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,7 @@ class _RestDeviceSource(InventorySource):
         return params
 
     async def _request(self, path: str, params: dict | None = None) -> dict:
-        connector = aiohttp.TCPConnector(ssl=self.cfg.verify_ssl if self.cfg.verify_ssl else False)
+        connector = aiohttp.TCPConnector(ssl=ssl_setting(self.cfg.verify_ssl))
         timeout = aiohttp.ClientTimeout(total=self.cfg.timeout)
         url = f"{self.cfg.url}{path}"
         try:
@@ -188,6 +189,13 @@ class _RestDeviceSource(InventorySource):
             "tags": tags,
             "custom_fields": record.get("custom_fields", {}) or {},
         }
+        vc = record.get("virtual_chassis")
+        if isinstance(vc, dict):
+            extra["virtual_chassis"] = self._ref_name(vc)
+            extra["vc_position"] = record.get("vc_position")
+            master = self._ref_name(vc.get("master")) if vc.get("master") else None
+            if master and master != name:
+                extra["vsf_member_of"] = master
         item: dict[str, Any] = {
             "name": name,
             "host": host or name,
@@ -427,7 +435,7 @@ class InfrahubSource(InventorySource):
 
     async def _graphql(self, query: str) -> dict:
         connector = aiohttp.TCPConnector(
-            ssl=self.cfg.verify_ssl if self.cfg.verify_ssl else False
+            ssl=ssl_setting(self.cfg.verify_ssl)
         )
         timeout = aiohttp.ClientTimeout(total=self.cfg.timeout)
         url = self._graphql_url
@@ -676,7 +684,7 @@ class VaultClient:
             return None
         path = self.cfg.path_template.format(device=device_name, name=device_name)
         url = self._secret_url(path)
-        connector = aiohttp.TCPConnector(ssl=self.cfg.verify_ssl if self.cfg.verify_ssl else False)
+        connector = aiohttp.TCPConnector(ssl=ssl_setting(self.cfg.verify_ssl))
         timeout = aiohttp.ClientTimeout(total=self.cfg.timeout)
         try:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -719,7 +727,7 @@ class VaultClient:
         if not (self.cfg.url and self.cfg.token):
             return {"enabled": True, "reachable": False,
                     "error": "Vault URL/token missing (set VAULT_ADDR / VAULT_TOKEN)."}
-        connector = aiohttp.TCPConnector(ssl=self.cfg.verify_ssl if self.cfg.verify_ssl else False)
+        connector = aiohttp.TCPConnector(ssl=ssl_setting(self.cfg.verify_ssl))
         timeout = aiohttp.ClientTimeout(total=self.cfg.timeout)
         try:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:

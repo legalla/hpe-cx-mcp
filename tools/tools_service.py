@@ -99,6 +99,7 @@ async def create_vlan_service(
     vrf: str = None,
     import_route_targets: list = None,
     export_route_targets: list = None,
+    evpn: bool = True,
     tag_uplinks: bool = True,
     apply: bool = False,
 ) -> dict:
@@ -113,7 +114,10 @@ async def create_vlan_service(
     Params: `vlan_id` (required), `name` (default VLAN<id>), `devices`/`site` (targets),
     `vni` (deduced if omitted), `gateway` (anycast IP/CIDR; otherwise pure L2), `vrf`
     (required if `gateway`), `gateway_mac`/`import_route_targets`/`export_route_targets`
-    (deduced if omitted), `apply` (False=plan only, True=applies).
+    (deduced if omitted), `evpn` (default True; set to False for an Extended Edge /
+    Stub-VTEP device that maps the VLAN to a VNI WITHOUT participating in
+    BGP-EVPN — skips the EVPN route-target step entirely, no RT questions/
+    deduction), `apply` (False=plan only, True=applies).
 
     If information is missing, returns status='need_info' with `questions`.
     """
@@ -159,7 +163,7 @@ async def create_vlan_service(
             candidates=candidates, reachable=reachable, vtep_devices=vtep_devices,
             unreachable=unreachable, vni=vni, gateway=gateway, gateway_mac=gateway_mac,
             vrf=vrf, import_rts=import_route_targets, export_rts=export_route_targets,
-            apply=apply,
+            evpn=evpn, apply=apply,
         )
     else:
         result = await _provision_traditional_service(
@@ -183,7 +187,7 @@ async def create_vlan_service(
                     gateway_mac=gateway_mac, vrf=vrf,
                     import_route_targets=import_route_targets,
                     export_route_targets=export_route_targets,
-                    tag_uplinks=tag_uplinks,
+                    evpn=evpn, tag_uplinks=tag_uplinks,
                 ),
             )
         except Exception:
@@ -193,7 +197,8 @@ async def create_vlan_service(
 
 async def _provision_fabric_service(*, vlan_id, name, explicit_devices, site, candidates,
                                     reachable, vtep_devices, unreachable, vni, gateway,
-                                    gateway_mac, vrf, import_rts, export_rts, apply) -> dict:
+                                    gateway_mac, vrf, import_rts, export_rts, evpn=True,
+                                    apply) -> dict:
     # Target = explicitly requested VTEPs, otherwise all reachable VTEPs
     if explicit_devices:
         targets = [d for d in candidates if d in vtep_devices]
@@ -228,15 +233,19 @@ async def _provision_fabric_service(*, vlan_id, name, explicit_devices, site, ca
             })
 
 
-    # Route-Target deduction
+    # Route-Target deduction (skipped entirely for a non-EVPN / Extended Edge
+    # target: plain VLAN-to-VNI mapping via a static VXLAN tunnel, no EVPN RT).
     eff_import = import_rts
     eff_export = export_rts
-    if (eff_import is None or eff_export is None) and eff_vni is not None:
-        from aruba_client import ArubaOSCXClient as _Cli
+    if evpn and (eff_import is None or eff_export is None) and eff_vni is not None:
+        from clients.aruba_client import ArubaOSCXClient as _Cli
         deduced = _Cli.deduce_route_targets(ref_ctx.get("rt_template"), vlan_id,
                                             eff_vni, ref_ctx.get("bgp_asn"))
         eff_import = eff_import or deduced
         eff_export = eff_export or deduced
+    elif not evpn:
+        eff_import = None
+        eff_export = None
 
     # Active-gateway (optional)
     eff_gw_mac = gateway_mac
@@ -271,9 +280,11 @@ async def _provision_fabric_service(*, vlan_id, name, explicit_devices, site, ca
         {"action": "create_vlan", "vlan": vlan_id, "name": svc_name},
         {"action": "create_l2vni", "vni": eff_vni, "vlan": vlan_id,
          "vxlan_interface": ref_ctx.get("vxlan_interface", "vxlan1")},
-        {"action": "set_evpn_vlan_rt", "vlan": vlan_id,
-         "import_route_targets": eff_import, "export_route_targets": eff_export},
     ]
+    if evpn:
+        steps_template.append({"action": "set_evpn_vlan_rt", "vlan": vlan_id,
+                               "import_route_targets": eff_import,
+                               "export_route_targets": eff_export})
     if gateway:
         steps_template.append({
             "action": "create_svi", "vlan": vlan_id, "vrf": vrf,
@@ -284,6 +295,7 @@ async def _provision_fabric_service(*, vlan_id, name, explicit_devices, site, ca
     plan = {dev: steps_template for dev in targets}
     service = {
         "vlan": vlan_id, "name": svc_name, "network_type": "fabric", "vni": eff_vni,
+        "evpn": evpn,
         "import_route_targets": eff_import, "export_route_targets": eff_export,
         "gateway": gateway, "vrf": vrf, "active_gateway_mac": eff_gw_mac,
     }
@@ -302,8 +314,9 @@ async def _provision_fabric_service(*, vlan_id, name, explicit_devices, site, ca
                 steps_done.append(await client.create_vlan(vlan_id, svc_name))
                 steps_done.append(await client.create_l2vni(
                     eff_vni, vlan_id, ref_ctx.get("vxlan_interface", "vxlan1")))
-                steps_done.append(await client.set_evpn_vlan_rt(
-                    vlan_id, eff_import, eff_export))
+                if evpn:
+                    steps_done.append(await client.set_evpn_vlan_rt(
+                        vlan_id, eff_import, eff_export))
                 if gateway:
                     steps_done.append(await client.create_svi(
                         vlan_id, vrf, gateway, active_gateway_ip=gateway,

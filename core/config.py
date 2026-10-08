@@ -7,17 +7,52 @@ import json
 import logging
 import os
 import re
+import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # Default credentials from environment variables
 ENV_DEFAULT_USER = os.environ.get("ARUBA_DEFAULT_USERNAME", "admin")
 ENV_DEFAULT_PASS = os.environ.get("ARUBA_DEFAULT_PASSWORD", "")
 ENV_DEFAULT_API  = os.environ.get("ARUBA_API_VERSION", "v10.09")
 ENV_DEFAULT_SSH_PORT = int(os.environ.get("ARUBA_SSH_PORT", "22"))
+# TLS verification is ON by default (production posture). Labs with
+# self-signed certificates opt out per inventory (`defaults.verify_ssl: false`).
+ENV_DEFAULT_VERIFY_SSL = _env_bool("ARUBA_VERIFY_SSL", True)
+# Optional PEM bundle of the internal CA that signed the switch certificates.
+ENV_CA_BUNDLE = os.environ.get("ARUBA_CA_BUNDLE", "").strip()
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def ssl_setting(verify_ssl: bool):
+    """Value for ``aiohttp.TCPConnector(ssl=...)``.
+
+    False disables verification; True uses the system trust store, or an
+    ``SSLContext`` loaded with ``ARUBA_CA_BUNDLE`` when that file exists."""
+    global _SSL_CONTEXT
+    if not verify_ssl:
+        return False
+    if not ENV_CA_BUNDLE:
+        return True
+    if _SSL_CONTEXT is None:
+        if not os.path.isfile(ENV_CA_BUNDLE):
+            logger.warning("ARUBA_CA_BUNDLE '%s' not found — using the system trust store",
+                           ENV_CA_BUNDLE)
+            return True
+        _SSL_CONTEXT = ssl.create_default_context(cafile=ENV_CA_BUNDLE)
+    return _SSL_CONTEXT
 
 _API_VERSION_RE = re.compile(r"^v?\d+\.\d+$", re.IGNORECASE)
 
@@ -57,7 +92,7 @@ class DeviceConfig:
     username: str = field(default_factory=lambda: ENV_DEFAULT_USER)
     password: str = field(default_factory=lambda: ENV_DEFAULT_PASS)
     api_version: str = field(default_factory=lambda: ENV_DEFAULT_API)
-    verify_ssl: bool = False
+    verify_ssl: bool = field(default_factory=lambda: ENV_DEFAULT_VERIFY_SSL)
     timeout: int = 30
     tags: list[str] = field(default_factory=list)
     description: str = ""
@@ -117,7 +152,7 @@ class SourceConfig:
     type: str  # local | netbox | nautobot | infrahub
     url: str = ""
     token: str = ""
-    verify_ssl: bool = False
+    verify_ssl: bool = field(default_factory=lambda: ENV_DEFAULT_VERIFY_SSL)
     timeout: int = 15
     priority: int = 0  # lower number = higher priority
     options: dict = field(default_factory=dict)
@@ -167,6 +202,10 @@ class Inventory:
     sources: dict[str, SourceConfig] = field(default_factory=dict)
     source_order: list[str] = field(default_factory=lambda: [LOCAL_SOURCE])
     vault: VaultConfig = field(default_factory=VaultConfig)
+    # General connection defaults (username/password/api_version/verify_ssl/…)
+    # from the inventory `defaults:` block. Applied to EVERY device regardless of
+    # its source (local, NetBox, Infrahub…), env vars being the fallback.
+    defaults: dict = field(default_factory=dict)
 
     @property
     def has_external_sources(self) -> bool:
@@ -250,7 +289,7 @@ def _build_source(name: str, raw: dict | None) -> SourceConfig:
         type=stype,
         url=str(url or "").rstrip("/"),
         token=str(token or ""),
-        verify_ssl=bool(raw.get("verify_ssl", False)),
+        verify_ssl=bool(raw.get("verify_ssl", ENV_DEFAULT_VERIFY_SSL)),
         timeout=int(raw.get("timeout", 15)),
         options=options,
     )
@@ -354,7 +393,8 @@ def load_inventory(path: str) -> Inventory:
         raise InventoryError(
             f"Invalid inventory configuration in '{path}': {exc}"
         ) from exc
-    return Inventory(devices=devices, sources=sources, source_order=order, vault=vault)
+    return Inventory(devices=devices, sources=sources, source_order=order,
+                     vault=vault, defaults=_extract_defaults(data))
 
 
 def load_devices(path: str) -> dict[str, DeviceConfig]:
@@ -418,6 +458,28 @@ def _auto_detect(raw: str, path: str) -> dict:
     raise ValueError(f"Unrecognized file format: {path}. Use .yaml, .json or .toml")
 
 
+def _extract_defaults(data: dict) -> dict:
+    """Build the general connection-defaults dict from the inventory `defaults:`
+    block, falling back to environment variables. These apply to EVERY device
+    regardless of its source (local file, NetBox, Infrahub…)."""
+    defaults = data.get("defaults", {}) if isinstance(data, dict) else {}
+    if not isinstance(defaults, dict):
+        defaults = {}
+    return {
+        "username": defaults.get("username", ENV_DEFAULT_USER),
+        "password": defaults.get("password", ENV_DEFAULT_PASS),
+        "api_version": defaults.get("api_version", ENV_DEFAULT_API),
+        "verify_ssl": defaults.get("verify_ssl", ENV_DEFAULT_VERIFY_SSL),
+        "timeout": defaults.get("timeout", 30),
+        "site": defaults.get("site", ""),
+        "ssh_port": defaults.get("ssh_port", ENV_DEFAULT_SSH_PORT),
+        "ssh_username": defaults.get("ssh_username", ""),
+        "ssh_password": defaults.get("ssh_password", ""),
+        "access_mode": defaults.get("access_mode", "read-only"),
+        "vault": defaults.get("vault", False),
+    }
+
+
 def _parse_inventory(data: dict) -> dict[str, DeviceConfig]:
     """
     Supported formats:
@@ -447,27 +509,7 @@ def _parse_inventory(data: dict) -> dict[str, DeviceConfig]:
     result: dict[str, DeviceConfig] = {}
 
     # Extract global defaults
-    defaults = data.get("defaults", {})
-    global_user = defaults.get("username", ENV_DEFAULT_USER)
-    global_pass = defaults.get("password", ENV_DEFAULT_PASS)
-    global_api  = defaults.get("api_version", ENV_DEFAULT_API)
-    global_ssl  = defaults.get("verify_ssl", False)
-    global_timeout = defaults.get("timeout", 30)
-    global_site = defaults.get("site", "")
-
-    base_defaults = {
-        "username": global_user,
-        "password": global_pass,
-        "api_version": global_api,
-        "verify_ssl": global_ssl,
-        "timeout": global_timeout,
-        "site": global_site,
-        "ssh_port": defaults.get("ssh_port", ENV_DEFAULT_SSH_PORT),
-        "ssh_username": defaults.get("ssh_username", ""),
-        "ssh_password": defaults.get("ssh_password", ""),
-        "access_mode": defaults.get("access_mode", "read-only"),
-        "vault": defaults.get("vault", False),
-    }
+    base_defaults = _extract_defaults(data)
 
     # "sites" format — explicit per-site grouping (optional):
     #   sites:
@@ -534,7 +576,7 @@ def _build_device(item: dict, defaults: dict) -> DeviceConfig:
         username=item.get("username", defaults.get("username", ENV_DEFAULT_USER)),
         password=item.get("password", defaults.get("password", ENV_DEFAULT_PASS)),
         api_version=item.get("api_version", defaults.get("api_version", ENV_DEFAULT_API)),
-        verify_ssl=item.get("verify_ssl", defaults.get("verify_ssl", False)),
+        verify_ssl=item.get("verify_ssl", defaults.get("verify_ssl", ENV_DEFAULT_VERIFY_SSL)),
         timeout=int(item.get("timeout", defaults.get("timeout", 30))),
         tags=item.get("tags", []),
         description=item.get("description", ""),
@@ -556,7 +598,7 @@ def local_defaults() -> dict:
         "username": ENV_DEFAULT_USER,
         "password": ENV_DEFAULT_PASS,
         "api_version": ENV_DEFAULT_API,
-        "verify_ssl": False,
+        "verify_ssl": ENV_DEFAULT_VERIFY_SSL,
         "timeout": 30,
         "site": "",
         "ssh_port": ENV_DEFAULT_SSH_PORT,

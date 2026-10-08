@@ -47,11 +47,22 @@ def _tool_names_snippet() -> str:
 
 def test_flat_toolset_advertises_same_25_tools_as_before_the_split(tmp_path):
     names = _run_server_snippet(_tool_names_snippet(), tmp_path, CX_FLAT_TOOLSET="true")
-    assert len(names) == 25
+    # 25 dispatchers/kept-atomic tools from the original split + configure_redundancy
+    # (added for VSX pairing, mirroring the get_redundancy read dispatcher 1:1)
+    # + orchestrate_fabric_underlay (kept-atomic: takes spines/leafs device
+    # lists, doesn't fit the single-device configure_*(scope=...) dispatch model)
+    # + orchestrator (new generic name/params dispatcher over every multi-step
+    # orchestrator, collapsing them into one discoverable entry point)
+    # + orchestrate_fabric_overlay (kept-atomic, same spines/leafs shape).
+    assert len(names) == 29
     assert "get_system" in names
     assert "configure_service" in names
+    assert "configure_redundancy" in names
+    assert "orchestrator" in names
     assert "rollback" in names
     assert "manage_inventory" in names
+    assert "orchestrate_fabric_underlay" in names
+    assert "orchestrate_fabric_overlay" in names
 
 
 def test_legacy_deferred_tools_and_prefixes_still_resolve(tmp_path):

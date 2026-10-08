@@ -20,6 +20,10 @@ logs/
 backups/
 .backups/
 
+# ── Local working notes (not for distribution/review) ────────
+NOTES_MISSING_TOOLS.md
+
+
 # ── API specs (large reference files, not distributed) ───────
 openapi*.json
 

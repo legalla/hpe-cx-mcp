@@ -1,7 +1,13 @@
 services:
   hpe-cx-mcp:
-    build: .
-    image: hpe-cx-mcp:latest
+    build:
+      context: .
+      args:
+        # Keep in sync with ./VERSION (or export CX_VERSION=x.y.z before build).
+        CX_VERSION: ${CX_VERSION:-1.1.0}
+    # Immutable, versioned tag: never run `latest` in production. Roll back by
+    # pointing CX_VERSION at the previous tag and `docker compose up -d`.
+    image: hpe-cx-mcp:${CX_VERSION:-1.1.0}
     container_name: hpe-cx-mcp
     restart: unless-stopped
     ports:
@@ -10,6 +16,9 @@ services:
       - ./inventory:/app/inventory:ro
       - ./logs:/app/logs
       - ./secrets:/app/secrets
+      # Internal CA bundle used to verify switch / SoT TLS certificates.
+      # Drop your PEM chain in ./certs/ca-bundle.pem and set ARUBA_CA_BUNDLE.
+      - ./certs:/app/certs:ro
     # Secrets & deployment-specific values live in .env (git-ignored).
     # Copy .env.example to .env and fill it in. Provides:
     #   ARUBA_DEFAULT_USERNAME / ARUBA_DEFAULT_PASSWORD / ARUBA_API_VERSION
@@ -21,11 +30,22 @@ services:
       MCP_HOST:               0.0.0.0
       MCP_PORT:               "8000"
       INVENTORY_FILE:         /app/inventory/inventory.yaml
-      # ── Bearer authentication (named tokens) — OFF by default ──────────
-      # Set to "true" to require a valid Bearer token on every MCP request.
-      # The server then REFUSES TO START if no valid token exists in the file.
-      # Generate tokens inside the container with:
+      # ── TLS verification towards the switches ─────────────────────────
+      # ARUBA_VERIFY_SSL is the DEFAULT for every device (inventory
+      # `defaults.verify_ssl` / per-device `verify_ssl` override it). Keep
+      # "true" in production; a lab with self-signed certs should set
+      # `verify_ssl: false` in the inventory rather than here.
+      ARUBA_VERIFY_SSL:       "false"
+      # PEM bundle of the internal CA that signed the switch certificates.
+      # Used whenever verify_ssl is true (falls back to the system store).
+      ARUBA_CA_BUNDLE:        /app/certs/ca-bundle.pem
+      # ── Bearer authentication (named tokens) — ON (production) ─────────
+      # Every MCP request must carry a valid Bearer token. With 0 tokens the
+      # server starts LOCKED (HTTP 503) until one is generated. Use ONE token
+      # per client (never share), revoke on off-boarding, then hot-reload:
       #   docker compose exec hpe-cx-mcp python security/cx_token_manager.py generate --name <client>
+      #   docker compose exec hpe-cx-mcp python security/cx_token_manager.py revoke --name <client>
+      #   docker compose exec hpe-cx-mcp python security/cx_reload.py
       CX_AUTH_ENABLED:        "true"
       CX_TOKENS_FILE:         /app/secrets/.tokens
       # CX_TRUST_FORWARDED_FOR: "false"   # set true only behind a trusted proxy
@@ -33,11 +53,15 @@ services:
       # Uncomment and set to DEBUG to get verbose FastMCP logging (useful to
       # trace tool invocations / payloads). Accepts DEBUG|INFO|WARNING|ERROR.
       # FASTMCP_LOG_LEVEL:      "DEBUG"
-      # ── Audit logging (structured JSON lines) — OFF by default ─────────
-      CX_AUDIT_ENABLED:       "false"
+      # ── Audit logging (structured JSON lines) — ON (production) ────────
+      # Every write (configure_*/manage_config/run_ssh_*/…) is recorded with
+      # actor (token name), source IP, arguments (secrets redacted) and
+      # outcome. File rotates 10 MB x 5 under ./logs; STDOUT mirror lets the
+      # Docker logging driver ship the same records to your SIEM/Loki.
+      CX_AUDIT_ENABLED:       "true"
       CX_AUDIT_FILE:          /app/logs/audit.jsonl
-      CX_AUDIT_LEVEL:         "all"        # "all" or "writes"
-      # CX_AUDIT_STDOUT:       "false"     # also mirror audit records to stdout
+      CX_AUDIT_LEVEL:         "writes"     # "all" or "writes"
+      CX_AUDIT_STDOUT:        "true"       # also mirror audit records to stdout
       # ── Progressive disclosure (Tier-1/Tier-2) + functional prefixes ───
       # CX_DEFERRED_TOOLS: advertise only ~25 Tier-1 tools; reach the rest via
       #   the meta-tools search_tools / invoke_tool. CX_TOOL_PREFIXES: rename
@@ -57,14 +81,34 @@ services:
       #   Set "false" to keep only the docstring guidance. Per-call: force=true.
       CX_SSH_TOOL_REDIRECT:   "true"
       # ── Write safety: dry_run_token preview + rollback_id ──────────────
-      # CX_WRITE_SAFETY enables apply_plan/rollback + dry_run tokens. When
-      # CX_REQUIRE_DRY_RUN_TOKEN is true, a direct apply via invoke_tool is
-      # refused — callers must preview (apply=false) then apply_plan(token).
+      # CX_WRITE_SAFETY enables dry_run tokens + rollback. When
+      # CX_REQUIRE_DRY_RUN_TOKEN is true (production), a direct apply is
+      # REFUSED on every write path (flat configure_* dispatchers, invoke_tool):
+      # callers must run action=plan first, then action=apply with the
+      # returned dry_run_token (the plan is re-checked before applying).
       CX_WRITE_SAFETY:        "true"
-      CX_REQUIRE_DRY_RUN_TOKEN: "false"
+      CX_REQUIRE_DRY_RUN_TOKEN: "true"
       CX_DRY_RUN_TTL:         "900"        # token lifetime (seconds)
+      # A token is bound to (operation, plan hash, TTL), not to a caller. "true"
+      # also refuses tokens issued by ANOTHER MCP session (default: only reported
+      # in the apply result as dry_run_token_origin + warning).
+      CX_TOKEN_SESSION_BOUND: "false"
       # Write-safety stores live in a writable, mounted dir (uid 1000).
       CX_SECRETS_DIR:         /app/logs
+      # ── Apply-time safety rails ────────────────────────────────────────
+      # Every configure_* apply is wrapped in a firmware auto-checkpoint
+      # (confirmed commit): armed before the write, confirmed on success. If
+      # the write fails or the MCP dies mid-apply, the switch reverts by itself
+      # after CX_AUTO_CHECKPOINT_MINUTES (1-60). Set "false" to disable the
+      # safety net globally; a single call can also opt out with
+      # auto_checkpoint=false (or opt in with auto_checkpoint=true).
+      CX_AUTO_CHECKPOINT:     "true"
+      CX_AUTO_CHECKPOINT_MINUTES: "10"
+      # Objects that must never be updated/deleted without force=true. Comma-
+      # separated fnmatch globs matched against the URL-decoded REST path.
+      # Examples: /system/vrfs/mgmt, */bgp_neighbors/spine-RR,
+      #           /system/interfaces/1/1/2[78], /system/interfaces/lag*
+      CX_PROTECTED_OBJECTS:   "/system/vrfs/mgmt,*/bgp_neighbors/spine-RR"
       # ── SFTP configuration backup campaigns ──────────────────────────
       # Put the credentials in .env, never in MCP tool arguments or inventory.
       # The optional allowed-host list prevents an agent from exporting to an
@@ -81,5 +125,5 @@ services:
       # CX_BACKUP_TFTP_DIRECTORY: network-backups/cx
       # CX_BACKUP_TFTP_ALLOWED_HOSTS: tftp.example.net
       # CX_BACKUP_TFTP_TIMEOUT: "30"
-    # Decommenter si les switches sont sur le reseau local du serveur Docker :
+    # Uncomment if the switches live on the Docker host's local network:
     # network_mode: host

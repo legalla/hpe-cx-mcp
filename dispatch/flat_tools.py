@@ -48,6 +48,16 @@ from typing import Any, Callable, Optional
 
 log = logging.getLogger("cx-mcp.flat")
 
+try:  # write-safety facade (dry_run_token / rollback_id); optional
+    from .write_safety import write_safety as _ws
+except Exception:  # pragma: no cover
+    _ws = None
+
+try:  # per-call write options (force on protected objects)
+    from core import server_core as _core
+except Exception:  # pragma: no cover
+    _core = None
+
 # Server module, captured at install time so dispatchers can reach the legacy
 # tool functions and the shared helpers (_resolve_devices, _get_client, ...).
 _SRV: Any = None
@@ -83,13 +93,11 @@ def _registry(mcp: Any) -> Optional[dict]:
 # Target resolution + parallel fan-out
 # ──────────────────────────────────────────────────────────────────────
 def _coerce_device_list(device) -> list:
-    """Normalize the ``device`` argument into a list of device names.
-
-    Tolerant of MCP clients that serialize an array as a *string* instead of a
-    real JSON array — e.g. ``'["Access-01","Access-02"]'``, ``"['A','B']"`` or
-    plain comma-separated ``"Access-01, Access-02"``. A single device name passes
-    through unchanged. This keeps batched reads working regardless of how the
-    calling client encodes list arguments."""
+    """Normalize the ``device`` argument into a list of device names (real
+    list, JSON-array string, comma-separated string or single name). Delegates
+    to the shared server_core implementation so reads and writes agree."""
+    if _core is not None and hasattr(_core, "_coerce_device_list"):
+        return _core._coerce_device_list(device)
     if device is None:
         return []
     if isinstance(device, (list, tuple)):
@@ -98,7 +106,6 @@ def _coerce_device_list(device) -> list:
         s = device.strip()
         if not s:
             return []
-        # JSON-array-looking string: '["A","B"]' or "['A','B']"
         if s[0] == "[" and s[-1] == "]":
             try:
                 parsed = json.loads(s)
@@ -109,7 +116,6 @@ def _coerce_device_list(device) -> list:
             inner = s[1:-1]
             return [p.strip().strip("'\"") for p in inner.split(",")
                     if p.strip().strip("'\"")]
-        # Comma-separated string: "A,B"
         if "," in s:
             return [p.strip() for p in s.split(",") if p.strip()]
         return [s]
@@ -245,6 +251,8 @@ _MAP_INTERFACES = {
     "poe": "get_poe_status",
     "loopbacks": "get_loopbacks", "routed": "get_routed_ports",
     "svi": "get_vlan_interfaces", "lag": "get_lag",
+    "dhcp_relay": "get_dhcp_relay",
+    "interface_group": "get_interface_groups",
 }
 _MAP_SWITCHING = {
     "vlans": "get_vlans", "mac": "get_mac_table",
@@ -290,20 +298,42 @@ _MAP_APPS = {
 _MAP_W_INTERFACE = {
     "loopback": ("configure_loopback", "verify_loopback"),
     "routed_port": ("configure_routed_port", "verify_routed_port"),
+    "lag": ("configure_lag", "verify_lag"),
     "vxlan": ("configure_vxlan_interface", "verify_vxlan_interface"),
     "virtual_mac": ("configure_virtual_mac", "verify_virtual_mac"),
+    "vlan": ("configure_vlan", "verify_vlan"),
+    "svi": ("configure_svi", "verify_svi"),
+    "trunk": ("configure_trunk", "verify_trunk"),
+    "admin": ("configure_interface_admin", "verify_interface_admin"),
+    "dhcp_relay": ("configure_dhcp_relay", "verify_dhcp_relay"),
+    "interface_group": ("configure_interface_group", "verify_interface_group"),
+    "hostname": ("configure_hostname", "verify_hostname"),
+    # Orchestrators (multi-step, create/update/delete)
+    "l3_link": ("orchestrate_l3_link", "verify_routed_port"),
+    "access_port": ("orchestrate_access_port", "verify_access_port"),
+    "static_vxlan": ("orchestrate_static_vxlan", "verify_static_vxlan"),
+    "overlay": ("orchestrate_overlay", "verify_overlay"),
+    "overlay_service": ("orchestrate_overlay_service", "verify_overlay_service"),
 }
 _MAP_W_ROUTING = {
     "ospf": ("configure_ospf", "verify_ospf"),
     "bgp": ("configure_bgp", "verify_bgp"),
     "vrf": ("configure_vrf", "verify_vrf"),
     "evpn": ("configure_evpn", "verify_evpn"),
+    "static_route": ("configure_static_route", "verify_static_route"),
+    "redistribute": ("configure_redistribute", "verify_redistribute"),
+    "evpn_vlan": ("orchestrate_evpn_vlan", "verify_evpn_vlan"),
 }
 _MAP_W_SECURITY = {
     "port_auth": ("configure_port_auth", "verify_port_auth"),
     "aaa": ("configure_aaa", "verify_aaa"),
     "user_roles": ("configure_user_roles", "verify_user_roles"),
     "app_recognition": ("configure_app_recognition", "verify_app_recognition"),
+    "radius_dot1x": ("orchestrate_radius_dot1x", "verify_radius_dot1x"),
+}
+_MAP_W_REDUNDANCY = {
+    "vsx": ("configure_vsx", "verify_vsx"),
+    "vsx_pair": ("orchestrate_vsx_pair", "verify_vsx_cluster"),
 }
 
 # Diagnose: scope -> ordered list of (label, legacy_fn, extra_kwargs)
@@ -321,8 +351,148 @@ _MAP_DIAGNOSE = {
 # ──────────────────────────────────────────────────────────────────────
 # Write dispatch helper
 # ──────────────────────────────────────────────────────────────────────
+_TOKEN_HINT = ("dry_run_token required: run the same call with action='plan' "
+               "first, then re-run with action='apply' and the returned "
+               "dry_run_token.")
+
+
+def _ws_active() -> bool:
+    return _ws is not None and _ws.enabled
+
+
+def _caller_session() -> Optional[str]:
+    """Identity of the MCP session running this tool call (None if unavailable)."""
+    try:
+        return f"s{id(_core.mcp.get_context().session)}"
+    except Exception:  # noqa: BLE001 — outside a request / API differences
+        return None
+
+
+def _nothing_written(applied) -> bool:
+    """True when an apply failed on EVERY target before writing anything (so its
+    one-shot dry_run_token can safely be given back)."""
+    if not isinstance(applied, dict):
+        return False
+    status = applied.get("status")
+    if status in ("error", "forbidden"):
+        return True
+    results = applied.get("results")
+    if status != "partial" or not isinstance(results, dict) or not results:
+        return False
+    return all(isinstance(r, dict) and not r.get("ok") and "nothing written"
+               in str(r.get("error", "")) for r in results.values())
+
+
+async def _guarded_write(operation: str, fn: Callable, device, call: dict,
+                         apply: bool, dry_run_token: Optional[str],
+                         force: bool = False,
+                         auto_checkpoint: Optional[bool] = None,
+                         verbose: bool = False) -> dict:
+    """Run a legacy plan/apply write with the dry_run_token lifecycle.
+
+    plan  → ``fn(apply=False)``; a ``status=planned`` result is frozen and gets a
+            ``dry_run_token`` (no-op when write safety is disabled).
+    apply → when ``CX_REQUIRE_DRY_RUN_TOKEN`` is on, a missing token is refused.
+            A provided token is validated against a FRESH preview (same plan
+            hash → TOCTOU guard), consumed, then ``fn(apply=True)`` runs and a
+            ``rollback_id`` is journaled for the objects it created.
+    ``force`` lifts the CX_PROTECTED_OBJECTS guard for this apply only.
+    ``auto_checkpoint`` (None = CX_AUTO_CHECKPOINT default) lets a caller opt
+    out of the firmware auto-checkpoint safety net for this apply only."""
+    if not apply:
+        result = await fn(device=device, **{**call, "apply": False})
+        if (_ws_active() and isinstance(result, dict)
+                and result.get("status") == "planned" and "dry_run_token" not in result):
+            try:
+                sess = _caller_session()
+                _ws.freeze(result, operation, result.get("targets") or [],
+                           result.get("plan") or {},
+                           **({"issued_by": sess} if sess else {}))
+            except Exception:  # token issuance must never break the preview
+                log.exception("flat_tools: freeze failed for %s", operation)
+        return result
+
+    token_origin: dict = {}
+    if _ws_active():
+        if not dry_run_token:
+            if _ws.requires_token:
+                return {"status": "error", "operation": operation, "error": _TOKEN_HINT}
+        else:
+            token_origin = _ws.token_origin(dry_run_token, _caller_session())
+            if (token_origin.get("same_session") is False
+                    and os.environ.get("CX_TOKEN_SESSION_BOUND", "false").lower() == "true"):
+                return {"status": "error", "operation": operation,
+                        "error": ("dry_run_token was issued to a different MCP session "
+                                  "(CX_TOKEN_SESSION_BOUND=true): run the plan again in "
+                                  "this session.")}
+            preview = await fn(device=device, **{**call, "apply": False})
+            fresh_plan = preview.get("plan") if isinstance(preview, dict) else None
+            err = _ws.require_token(dry_run_token, operation, fresh_plan or {})
+            if err:
+                return {**err, "operation": operation}
+
+    force_ctx = ckpt_ctx = verb_ctx = None
+    if _core is not None:
+        force_ctx = _core.FORCE_PROTECTED.set(bool(force))
+        ckpt_ctx = _core.AUTO_CHECKPOINT_OVERRIDE.set(
+            None if auto_checkpoint is None else bool(auto_checkpoint))
+        if hasattr(_core, "VERBOSE_RESULT"):
+            verb_ctx = _core.VERBOSE_RESULT.set(bool(verbose))
+    try:
+        applied = await fn(device=device, **{**call, "apply": True})
+    finally:
+        if force_ctx is not None:
+            _core.FORCE_PROTECTED.reset(force_ctx)
+            _core.AUTO_CHECKPOINT_OVERRIDE.reset(ckpt_ctx)
+        if verb_ctx is not None:
+            _core.VERBOSE_RESULT.reset(verb_ctx)
+    if isinstance(applied, dict) and token_origin:
+        applied["dry_run_token_origin"] = token_origin
+        if token_origin.get("same_session") is False:
+            applied["warning"] = (
+                (applied.get("warning", "") + " The dry_run_token was issued by ANOTHER "
+                 "MCP session (plan hash matched, so this is the previewed plan); "
+                 "set CX_TOKEN_SESSION_BOUND=true to refuse such tokens.").strip())
+    if (dry_run_token and _ws_active() and _nothing_written(applied)
+            and _ws.restore_token(dry_run_token)):
+        applied["token_restored"] = True
+        applied["note"] = ((applied.get("note", "") +
+                            " Nothing was written: the dry_run_token is still valid, "
+                            "re-run the same apply.").strip())
+    if (_ws_active() and isinstance(applied, dict)
+            and applied.get("status") in ("applied", "partial")):
+        try:
+            # Prefer the created-object list (exact inverse); fall back to the
+            # step plan emitted by the vlan-service orchestrators.
+            plan = applied.get("reversible") or applied.get("plan") or {}
+            targets = applied.get("targets") or (list(plan) if isinstance(plan, dict) else [])
+            rid = _ws.record(operation, targets, plan)
+            if rid:
+                applied["rollback_id"] = rid
+        except Exception:
+            log.exception("flat_tools: rollback journaling failed for %s", operation)
+    return applied
+
+
+def _flag_ignored_params(result, base: dict, call: dict, scope: str):
+    """Surface params the target function does not accept (they are dropped by
+    `_filtered_kwargs`) instead of letting a plan/apply look complete."""
+    ignored = sorted(k for k, v in base.items()
+                     if v is not None and k not in call and k != "device")
+    if ignored and isinstance(result, dict):
+        result["ignored_params"] = ignored
+        note = (f"params NOT supported by '{scope}' were ignored: {ignored}. "
+                "They were not applied — check the documented params.")
+        result["warning"] = f"{result['warning']} {note}" if result.get("warning") else note
+    return result
+
+
 async def _write_dispatch(tool: str, mapping: dict, scope: str, action: str,
-                          device, site, params: dict) -> dict:
+                          device, site, params: dict,
+                          dry_run_token: Optional[str] = None,
+                          force: bool = False,
+                          auto_checkpoint: Optional[bool] = None,
+                          verbose: bool = False) -> dict:
     entry = mapping.get(scope)
     if not entry:
         return {"error": f"[{tool}] unknown scope '{scope}'",
@@ -340,9 +510,11 @@ async def _write_dispatch(tool: str, mapping: dict, scope: str, action: str,
         return {"error": f"[{tool}] invalid action '{action}'",
                 "valid_actions": ["plan", "apply", "verify"]}
     fn = getattr(_SRV, cfg_name)
-    apply = action == "apply"
-    call = _filtered_kwargs(fn, dict(base, site=site, apply=apply))
-    return await fn(device=device, **call)
+    call = _filtered_kwargs(fn, dict(base, site=site))
+    result = await _guarded_write(cfg_name, fn, device, call,
+                                  action == "apply", dry_run_token, force,
+                                  auto_checkpoint, verbose)
+    return _flag_ignored_params(result, base, call, scope)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -426,12 +598,23 @@ async def get_interfaces(device: "str | list[str]" = None, scope: str = "physica
     """Interface state. For MULTIPLE devices pass a COMMA-SEPARATED string
     (e.g. `device='Access-01,Access-02'`) or a list; `site` targets a whole site
     — all fan out in a SINGLE batched call. `scope`: physical | transceivers |
-    counters | supported_transceivers | poe | loopbacks | routed | svi | lag.
-    `interface` filters physical/transceivers/counters/poe; `lag` filters lag.
-    `counters` returns rx/tx/error/drop traffic counters; `supported_transceivers`
-    lists the transceiver models the device supports; `poe` returns per-port
-    Power-over-Ethernet draw (watts) plus the chassis-wide PoE power budget —
-    use it for site/switch/port electrical (PoE) consumption questions."""
+    counters | supported_transceivers | poe | loopbacks | routed | svi | lag |
+    dhcp_relay | interface_group. `interface` filters physical/transceivers/
+    counters/poe/dhcp_relay (dhcp_relay: omit to discover ALL relays on the
+    device); `lag` filters lag; interface_group takes an optional
+    `params={'subsystem': 'line_card,1/1'}` to scope to one line card/chassis.
+    `counters` returns rx/tx/error/drop traffic counters;
+    `supported_transceivers` lists the transceiver models the device supports;
+    `poe` returns per-port Power-over-Ethernet draw (watts) plus the
+    chassis-wide PoE power budget — use it for site/switch/port electrical
+    (PoE) consumption questions. `physical` includes `l1_state` (bool, Layer 1
+    ready) + `l1_state_down_reason` (e.g. `group_speed_mismatch`,
+    `profile_mismatch`, `module_incompatible`, ... — only set when
+    `l1_state` is False) so a speed-mismatch/module fault is diagnosable
+    without `get_config(scope='raw')`/SSH. `svi` adds the active-gateway
+    (`vsx_virtual_ip4/ip6`, `vsx_virtual_gw_mac_v4/v6`, `active_gateway`;
+    same fields for an EVPN anycast gateway) and `ip_mtu`; `statistics` is
+    null (with `statistics_note`) when the device reports no counters."""
     return await _read_dispatch("get_interfaces", _MAP_INTERFACES, scope, device,
                                 site, {"interface": interface, "lag": lag,
                                        **(params or {})}, source=source, limit=limit)
@@ -583,57 +766,312 @@ async def get_config(device: "str | list[str]" = None, scope: str = "running",
 
 
 async def configure_interface(scope: str, action: str = "plan", device: str = None,
-                              site: str = None, params: dict = None) -> dict:
-    """Configure an interface. `scope`: loopback | routed_port | vxlan | virtual_mac.
-    `action`: plan (preview, default) | apply | verify. Pass the domain fields in
-    `params`, e.g. loopback -> {name, ip_address, vrf}; routed_port ->
-    {interface, ip_address, vrf, mtu, enable}; virtual_mac -> {mac}; vxlan ->
-    {interface, source_ip, static_peers, ...}."""
+                              site: str = None, params: dict = None,
+                              dry_run_token: str = None, force: bool = False,
+                              auto_checkpoint: bool = None,
+                              verbose: bool = False) -> dict:
+    """Configure an interface. `device` accepts ONE name, a COMMA-SEPARATED
+    string ('A,B,C') or a list; `site` targets a whole site — the SAME change is
+    applied to every target in ONE call (per-device results + summary).
+    `scope`: loopback | routed_port | lag | vxlan | virtual_mac | vlan | svi |
+    trunk | admin | dhcp_relay | interface_group | hostname | l3_link |
+    access_port | static_vxlan | overlay | overlay_service.
+    PER-DEVICE ADDRESSES: `ip_address` (loopback, routed_port, l3_link) and
+    `source_ip` (vxlan, static_vxlan) must differ on each switch — for several
+    devices pass a mapping {"<device>": "<ip>", ...}. The same address is only
+    accepted on the 2 members of one VSX pair (anycast VTEP / keepalive-less
+    designs); any other duplicate is refused before writing.
+    `action`: plan (preview, default) | apply | verify. Pass the domain fields in `params`:
+      loopback    -> {name, ip_address, vrf}
+      routed_port -> {interface, ip_address (CIDR), vrf, create_vrf (bool: create
+                     the VRF first if missing), mtu, description, enable,
+                     remove_from_lag, delete_empty_lags}. THIS is the tool to put an IP on a
+                     physical port (L3 / no switchport). For SEVERAL ports on
+                     the SAME device set in ONE call, pass `interfaces`: [{
+                     interface, ip_address, mtu, description, enable, vrf,
+                     create_vrf, remove_from_lag}, ...] instead of `interface`.
+      lag         -> {lag_id, members, mode (static/lacp-active/lacp-passive),
+                     lacp_fallback, lacp_rate, mclag_enabled, vlan_mode
+                     (access/trunk/native-tagged/native-untagged), access_vlan,
+                     native_vlan, trunk_vlans, description, mtu,
+                     evpn_multihoming_esi, ...} — one call builds a complete
+                     trunk MC-LAG (covers standard, VSX MC-LAG and ESI-LAG).
+      vlan        -> {vlan_id, name, description, delete} for ONE VLAN, or
+                     {vlans: [{vlan_id, name, description}, ...]} for a BATCH
+                     (device x vlan matrix, one status per cell). Bare VLAN
+                     definition (no VNI/SVI/RT). `delete: true, cascade: true`
+                     also removes each VLAN's SVI/active-gateway, EVPN RT and
+                     L2VNI first (core -> spine cleanup).
+      svi         -> {vlan_id, vrf, ip_cidr, active_gateway_ip,
+                     active_gateway_mac, delete}; batch delete: {vlans: [..],
+                     delete: true}
+      trunk       -> {interface, add_vlans, remove_vlans}
+      admin       -> {interface, enable} (plain L2 port up/down; if the operational
+                     admin_state does not follow, a real down/up flap is done)
+      hostname    -> {hostname} for one device, or {hostnames: {"<device>":
+                     "<hostname>", ...}} to rename 50 switches in ONE call.
+      virtual_mac -> {mac};  vxlan -> {interface, source_ip, static_peers, ...}
+      dhcp_relay  -> {interface, vrf, ipv4_servers, ipv6_servers, bootp_gateway,
+                     delete} (`vrf` MUST match the interface's actual VRF).
+      interface_group -> {group, speed (5g|10g|25g|40g|50g|100g|200g),
+                     subsystem (optional, 'line_card,1/1'), delete}: set a
+                     port-group's link speed (CLI `system interface-group`);
+                     WARNING it can bounce every port in the block.
+    ORCHESTRATORS (multi-step, idempotent, `delete: true` tears down):
+      l3_link     -> {interface, ip_address (CIDR), vrf, create_vrf, vrf_rd,
+                     vrf_import_rts, vrf_export_rts (optional EVPN RD/RT), mtu,
+                     description, ospf_area, ospf_instance_tag,
+                     ospf_network_type (='point_to_point'; None = broadcast),
+                     remove_from_lag, delete_empty_lags, ensure_internal_vlan_range,
+                     internal_vlan_range_size, verify_connected_route,
+                     delete, delete_vrf}: VRF -> routed port -> OSPF router/area
+                     (created if missing) -> OSPF interface in one call. After
+                     apply, an MTU mismatch with the LLDP neighbour (if in the
+                     inventory) is reported in `warnings`/`mtu_mismatches`.
+                     For SEVERAL point-to-point links on the SAME device set in
+                     ONE call (one shared VRF context), pass `links`: [{
+                     interface, ip_address, mtu, description, enable, ospf_area,
+                     ospf_instance_tag, remove_from_lag}, ...] instead of
+                     `interface`/`ip_address`/etc.
+      access_port -> {interfaces (list/CSV/range '1/1/1-1/1/24'), access_vlan,
+                     voice_vlan, description, enable, stp_edge, bpdu_guard,
+                     root_guard, loop_guard, port_auth: {methods|dot1x|mac_auth,
+                     auth_precedence, roles, ...}, delete}: no routing + access
+                     VLAN + no shutdown + admin-edge/bpdu-guard + 802.1X per port.
+      static_vxlan -> {vxlan_interface (=vxlan1), source_ip ({device: ip}
+                     mapping for several VTEPs), dest_udp_port,
+                     inter_vxlan_bridging_mode (deny|static-evpn|static-all),
+                     vlans: [{vlan_id, vni, name}] | {vlan_id: vni}, peers:
+                     [{destination, vnis (default all), vrf}] (only VTEPs outside
+                     the call — with a source_ip mapping the VTEPs of the call
+                     are meshed automatically, full_mesh=true), delete,
+                     delete_vlans, delete_vxlan_interface}: static VXLAN
+                     (head-end replication, NO EVPN): VTEP + VLAN/VNI maps +
+                     static tunnels to every remote VTEP in one call.
+      overlay     -> {vxlan_interface (=vxlan1), source_ip ({device: ip}
+                     mapping), dest_udp_port, mode (evpn|static|stub, =evpn),
+                     inter_vxlan_bridging_mode (auto 'static-evpn' for
+                     mode=stub), evpn_options: {dyn_vxlan_tunnel_bridging_mode,
+                     arp_suppression, nd_suppression, redistribute_local_mac,
+                     redistribute_local_svi, options}, virtual_mac
+                     ({device: mac} mapping), bgp_evpn: {asn, router_id
+                     ({device: ip} or 'loopback0'), vrf,
+                     neighbors, options} (OMITTED by default — nothing
+                     BGP-related is touched unless given), delete,
+                     delete_vxlan_interface, verify_operational (=true: the
+                     result is NOT ok if vxlan1/VNIs/EVIs are not up)}: DEVICE-level VTEP bring-up —
+                     VXLAN interface -> (mode evpn/stub) global EVPN + virtual
+                     MAC + optional BGP-EVPN. mode='static' (Extended Edge)
+                     stops after the interface.
+      overlay_service -> {services: [{vlan_id, vni, name, description, attach
+                     (evpn|static|stub, =evpn), rd, import_rts, export_rts,
+                     route_target_auto_mode, svi_vrf, svi_ip ({device: cidr}
+                     mapping accepted),
+                     active_gateway_ip, active_gateway_mac, static_peers: [
+                     {destination, vnis, vrf}]}], vxlan_interface (=vxlan1),
+                     require_vxlan_interface (=true), delete, delete_vlans}:
+                     BATCH VLAN -> L2VNI -> EVPN route-target and/or static
+                     peer, several services in ONE call. Requires
+                     `orchestrate_overlay` (scope=overlay) to have run first on
+                     the target (refuses otherwise); attach='stub' additionally
+                     requires mode='stub' there.
+    Workflow: `plan` returns a `dry_run_token`; `apply` REQUIRES that token
+    (same params) and re-checks the plan before writing. Each apply runs inside
+    a firmware auto-checkpoint (auto-revert on failure; opt out for this call
+    with `auto_checkpoint=false`). `force=true` overrides the
+    CX_PROTECTED_OBJECTS guard (uplinks, peer-groups, mgmt VRF...). Long
+    per-object result lists are compacted to a summary (count/ok/failed +
+    failed items); `verbose=true` returns the full detail."""
     return await _write_dispatch("configure_interface", _MAP_W_INTERFACE, scope,
-                                 action, device, site, params)
+                                 action, device, site, params, dry_run_token, force,
+                                 auto_checkpoint, verbose)
 
 
 async def configure_routing(scope: str, action: str = "plan", device: str = None,
-                            site: str = None, params: dict = None) -> dict:
-    """Configure routing. `scope`: ospf | bgp | vrf | evpn. `action`: plan
-    (default) | apply | verify. Pass domain fields in `params`, e.g. bgp ->
-    {asn, vrf, router_id, neighbors}; ospf -> {vrf, router_id, area_id,
-    interfaces}; vrf -> {name, ...}; evpn -> {...}."""
+                            site: str = None, params: dict = None,
+                            dry_run_token: str = None, force: bool = False,
+                            auto_checkpoint: bool = None,
+                            verbose: bool = False) -> dict:
+    """Configure routing. `device` accepts ONE name, a COMMA-SEPARATED string
+    ('A,B,C') or a list; `site` targets a whole site — ONE call applies to every
+    target. `scope`: ospf | bgp | vrf | evpn | static_route |
+    redistribute | evpn_vlan. `action`: plan (default) | apply | verify. Pass domain
+    fields in `params`, e.g. bgp -> {asn, vrf, router_id ({device: ip} or
+    'loopback0'), neighbors, wait_established (s: wait for Established, report
+    the last BGP error otherwise)}; ospf ->
+    {vrf, router_id ({device: ip} mapping or 'loopback0'), area_id,
+    interfaces, passive_interfaces, passive_interface_default}; vrf -> {name,
+    delete, ...}; evpn ->
+    {dyn_vxlan_tunnel_bridging_mode, arp_suppression, nd_suppression,
+    redistribute_local_mac, redistribute_local_svi, options}; static_route -> {prefix, vrf, nexthops, delete}
+    (batch delete: {prefixes: [...], delete: true}); redistribute ->
+    {protocol ('bgp'|'ospf'), vrf, asn, instance_tag, address_family, sources}.
+    vrf -> {name, rd ('ASN:nn'|'IP:nn', {device: rd} mapping, or 'auto' =
+    <loopback0>:<l3vni>), import_route_targets,
+    export_route_targets (VRF-level EVPN RTs, 'auto' allowed), l3vni (alias
+    vni; binds the L3 VNI to the VRF on `vxlan_interface`=vxlan1), bgp_vrf
+    (default true with l3vni: router bgp / vrf / address-family ipv4 unicast
+    for type-5), bgp_asn (default: default-VRF ASN), redistribute
+    (['connected','static',...]),
+    address_families: [{address_family, import/export RTs}] (non-EVPN only)}.
+    bgp neighbors: members of a peer-group listed in the same call get the
+    group's remote_as + activate only (update-source/send-community/RR-client
+    are inherited on the device, never duplicated); 'loopback0' as
+    update_source is written as the local interface;
+    send_community 'both' on l2vpn-evpn is sent as 'extended'.
+    Params the scope does not accept are NOT applied and are listed in the
+    result's `ignored_params`/`warning`.
+    ORCHESTRATOR evpn_vlan -> {vlan_id, name, vni, vxlan_interface (=vxlan1),
+    vxlan_source_ip (sets the VTEP source if given; {device: ip} mapping for
+    several devices, same IP only on a VSX pair), evpn (bool), rd (='auto'),
+    import_rts / export_rts (='auto'; explicit 'ASN:nn' lists accepted),
+    route_target_auto_mode (default|legacy), svi_vrf, svi_ip (CIDR),
+    active_gateway_ip, active_gateway_mac, delete}: VLAN -> L2VNI -> `evpn vlan`
+    RD/RT -> optional anycast SVI, with EXPLICIT RD/RT (vs configure_service
+    scope=vlan which auto-discovers the fabric and deduces RTs); `delete: true`
+    removes SVI -> RT -> L2VNI -> VLAN.
+    Workflow: `plan` returns a `dry_run_token`; `apply` REQUIRES that token
+    (same params) and re-checks the plan before writing. Each apply runs inside
+    a firmware auto-checkpoint (auto-revert on failure; opt out for this call
+    with `auto_checkpoint=false`). `force=true` overrides the
+    CX_PROTECTED_OBJECTS guard (uplinks, peer-groups, mgmt VRF...)."""
     return await _write_dispatch("configure_routing", _MAP_W_ROUTING, scope,
-                                 action, device, site, params)
+                                 action, device, site, params, dry_run_token, force,
+                                 auto_checkpoint, verbose)
+
+
+async def configure_redundancy(scope: str, action: str = "plan", device: str = None,
+                               site: str = None, params: dict = None,
+                               dry_run_token: str = None, force: bool = False,
+                               auto_checkpoint: bool = None,
+                               verbose: bool = False) -> dict:
+    """Configure VSX / VSF redundancy. `scope`: vsx | vsx_pair. `action`: plan
+    (default) | apply | verify.
+      vsx_pair (ORCHESTRATOR, preferred for a new pair or a full teardown) ->
+        {peer_device, isl_members: ['1/1/49','1/1/50'], peer_isl_members,
+         isl_lag_id (=256), isl_mode (=lacp-active), keepalive_interface,
+         peer_keepalive_interface, keepalive_ip / peer_keepalive_ip (CIDR),
+         keepalive_vrf (=KEEPALIVE), keepalive_udp_port, system_mac, role
+         (=primary), config_sync (bool), config_sync_features ['vlan','vrf',
+         'aaa',...], linkup_delay_timer, split_recovery, delete,
+         delete_keepalive_vrf, verify}: creates the keepalive VRF + routed
+        keepalive port + ISL LAG + VSX pairing on BOTH members (role mirrored,
+        keepalive IPs swapped) and reads the ISL state afterwards; `delete:
+        true` removes VSX + ISL LAG + keepalive on both members.
+      vsx (atomic /system/vsx only) -> {peer_device, role, peer_role,
+        isl_interface, peer_isl_interface, keepalive_interface,
+        peer_keepalive_interface, keepalive_vrf, keepalive_src_ip,
+        keepalive_peer_ip, system_mac, delete} — assumes ISL LAG / keepalive
+        port already exist.
+    Workflow: `plan` returns a `dry_run_token`; `apply` REQUIRES that token
+    (same params) and re-checks the plan before writing. Each apply runs inside
+    a firmware auto-checkpoint (auto-revert on failure; opt out for this call
+    with `auto_checkpoint=false`). `force=true` overrides the
+    CX_PROTECTED_OBJECTS guard."""
+    return await _write_dispatch("configure_redundancy", _MAP_W_REDUNDANCY, scope,
+                                 action, device, site, params, dry_run_token, force,
+                                 auto_checkpoint, verbose)
 
 
 async def configure_security(scope: str, action: str = "plan", device: str = None,
-                             site: str = None, params: dict = None) -> dict:
-    """Configure access security. `scope`: port_auth | aaa | user_roles |
-    app_recognition. `action`: plan (default) | apply | verify. Pass domain
-    fields in `params`, e.g. port_auth -> {interfaces, ...}."""
+                             site: str = None, params: dict = None,
+                             dry_run_token: str = None, force: bool = False,
+                             auto_checkpoint: bool = None,
+                             verbose: bool = False) -> dict:
+    """Configure access security / AAA. `device` accepts ONE name, a
+    COMMA-SEPARATED string ('A,B,C') or a list; `site` targets a whole site —
+    ONE call applies to every target. `scope`: port_auth | aaa | user_roles |
+    app_recognition | radius_dot1x. `action`: plan (default) | apply | verify. `params`:
+      radius_dot1x (ORCHESTRATOR, preferred for a NAC bring-up) ->
+                    {radius_servers: [{address, passkey, vrf (=mgmt), port,
+                    accounting_udp_port, timeout, retries, tracking_enable}],
+                    server_group (=RADIUS), dot1x, mac_auth, coa (RADIUS
+                    dyn-authorization), coa_udp_port, accounting,
+                    mac_auth_address_format, roles: [{name, vlan_tag, ...}],
+                    interfaces (list/CSV/range), port_auth: {...}, delete,
+                    delete_roles}: group -> servers -> global dot1x/mac-auth
+                    enable + CoA -> roles -> per-port 802.1X in one call;
+                    `delete: true` unwinds everything in reverse order.
+      aaa        -> GLOBAL RADIUS/TACACS+ servers + server groups + management
+                    authentication order: {server_groups: [{name, type:
+                    radius|tacacs}], radius_servers: [{address, vrf, passkey,
+                    port, auth_type, timeout, retries, server_group: {GRP: 1},
+                    tracking_enable}], tacacs_servers: [...], authentication/
+                    authorization/accounting: {ssh: ["GRP","local"]}, delete}.
+                    Use this BEFORE port_auth so the server group exists.
+      user_roles -> local Port-Access roles + GBP/ABP policies: {roles: [{name,
+                    vlan_tag, vlan_mode, description, reauth_period, ...}],
+                    gbp_tags, gbps, abps, delete}.
+      port_auth  -> 802.1X / MAC-auth on access ports (many ports in ONE call):
+                    {interfaces: ["1/1/1", ...], methods: {dot1x: true |
+                    {auth_enable, reauth_enable, reauth_period, max_retries,
+                    eapol_timeout, ...}, "mac-auth": true | {auth_enable,
+                    cached_reauth_enable, radius_server_group}},
+                    auth_precedence: ["dot1x","mac-auth"] (or "dot1x mac-auth"),
+                    auth_priority, auth_mode (client-mode|device-mode|
+                    multi-domain|proxy-mode), clients_limit,
+                    mda_data_clients_limit, roles: {auth, fallback|guest,
+                    critical, critical_voice, reject, pre_auth}, create_roles:
+                    [{name, vlan_tag, ...}] (roles created first),
+                    concurrent_onboarding, radius_override}. Shortcuts
+                    `dot1x: true` / `mac_auth: true` are accepted; a malformed
+                    shape returns the expected schema instead of writing.
+      app_recognition -> {enable, mode, abp_session_limit_exceed_action}.
+    Workflow: `plan` returns a `dry_run_token`; `apply` REQUIRES that token
+    (same params) and re-checks the plan before writing. Each apply runs inside
+    a firmware auto-checkpoint (auto-revert on failure; opt out for this call
+    with `auto_checkpoint=false`). `force=true` overrides the
+    CX_PROTECTED_OBJECTS guard. Per-interface results are compacted to a
+    summary (ok/failed/failed_items) unless `verbose=true`."""
     return await _write_dispatch("configure_security", _MAP_W_SECURITY, scope,
-                                 action, device, site, params)
+                                 action, device, site, params, dry_run_token, force,
+                                 auto_checkpoint, verbose)
 
 
 async def configure_service(scope: str = "vlan", action: str = "plan",
                             device: str = None, site: str = None,
-                            params: dict = None) -> dict:
+                            params: dict = None, dry_run_token: str = None,
+                            force: bool = False, auto_checkpoint: bool = None,
+                            verbose: bool = False) -> dict:
     """Orchestrated L2/L3 VLAN service. `scope`: vlan. `action`:
-      plan        : preview the create plan (default)
-      apply       : create/update the service
-      delete      : remove the service
-      delete_plan : preview the delete plan
+      plan        : preview the create plan (default) -> returns dry_run_token
+      apply       : create/update the service (REQUIRES the plan's dry_run_token)
+      delete_plan : preview the delete plan -> returns dry_run_token
+      delete      : remove the service (REQUIRES the delete_plan's dry_run_token)
       verify      : check the resulting VLAN state
-    Pass service fields in `params` (vlan_id, name, vni, svi_ip, vrf, interfaces…)."""
+    Pass service fields in `params` (vlan_id, name, vni, svi_ip, vrf, interfaces,
+    evpn — set evpn=false for an Extended Edge / Stub-VTEP device: maps the VLAN
+    to a VNI WITHOUT an EVPN route-target, no BGP-EVPN participation).
+    For EXPLICIT RD / route-targets (no fabric discovery / RT deduction) use
+    configure_routing(scope='evpn_vlan') instead.
+    (The VLAN-service orchestrator has its own per-device rollback; the
+    firmware auto-checkpoint / `auto_checkpoint` flag apply to configure_*.)"""
     if scope != "vlan":
         return {"error": f"[configure_service] unknown scope '{scope}'",
                 "valid_scopes": ["vlan"]}
     base = dict(params or {})
+
+    def _adapt_devices_kw(fn: Callable) -> Callable:
+        """create_vlan_service/delete_vlan_service take `devices` (a list), not
+        `device` \u2014 _guarded_write always calls fn(device=..., **kw)."""
+        async def _wrapped(*, device=None, **kwargs):
+            if device is not None and "devices" not in kwargs:
+                kwargs["devices"] = _coerce_device_list(device)
+            return await fn(**kwargs)
+        return _wrapped
+
     if action in ("plan", "apply"):
         fn = _SRV.create_vlan_service
-        kw = _filtered_kwargs(fn, dict(base, site=site, apply=(action == "apply")))
-        return await fn(device=device, **kw)
+        kw = _filtered_kwargs(fn, dict(base, site=site))
+        return await _guarded_write("create_vlan_service", _adapt_devices_kw(fn),
+                                    device, kw, action == "apply", dry_run_token,
+                                    force, auto_checkpoint, verbose)
     if action in ("delete", "delete_plan"):
         fn = _SRV.delete_vlan_service
-        kw = _filtered_kwargs(fn, dict(base, site=site, apply=(action == "delete")))
-        return await fn(device=device, **kw)
+        kw = _filtered_kwargs(fn, dict(base, site=site))
+        return await _guarded_write("delete_vlan_service", _adapt_devices_kw(fn),
+                                    device, kw, action == "delete", dry_run_token,
+                                    force, auto_checkpoint, verbose)
     if action == "verify":
         targets = await _resolve_targets(device, site)
         if not targets:
@@ -643,6 +1081,86 @@ async def configure_service(scope: str = "vlan", action: str = "plan",
         return _envelope("vlan", targets, results, errors)
     return {"error": f"[configure_service] invalid action '{action}'",
             "valid_actions": ["plan", "apply", "delete", "delete_plan", "verify"]}
+
+
+# Single entry point for every multi-step orchestrator: name -> (orchestrate_fn,
+# verify_fn|None). Deliberately excludes orchestrate_fabric_underlay (it takes
+# `spines`/`leafs` device LISTS instead of a single device/site target — see
+# _KEEP_ATOMIC; call it directly, it doesn't fit this device=/site= dispatch).
+_MAP_ORCHESTRATORS: dict[str, tuple[str, Optional[str]]] = {
+    "vsx_pair": ("orchestrate_vsx_pair", "verify_vsx_cluster"),
+    "l3_link": ("orchestrate_l3_link", "verify_routed_port"),
+    "access_port": ("orchestrate_access_port", "verify_access_port"),
+    "static_vxlan": ("orchestrate_static_vxlan", "verify_static_vxlan"),
+    "evpn_vlan": ("orchestrate_evpn_vlan", "verify_evpn_vlan"),
+    "radius_dot1x": ("orchestrate_radius_dot1x", "verify_radius_dot1x"),
+    "overlay": ("orchestrate_overlay", "verify_overlay"),
+    "overlay_service": ("orchestrate_overlay_service", "verify_overlay_service"),
+}
+
+
+async def orchestrator(name: str, action: str = "plan", device: str = None,
+                       site: str = None, params: dict = None,
+                       dry_run_token: str = None, force: bool = False,
+                       auto_checkpoint: bool = None, verbose: bool = False) -> dict:
+    """Single entry point for every multi-step orchestrator: `name` selects
+    which one, `params` carries its own arguments (unknown keys for that
+    orchestrator are silently dropped, never rejected). Same as calling
+    `configure_interface`/`configure_routing`/`configure_security`/
+    `configure_redundancy` with that scope directly — this dispatcher just
+    collapses all of them into one discoverable name/params surface.
+
+    Valid `name` values (see configure_interface/routing/security/redundancy
+    docstrings for each one's exact `params` shape):
+      vsx_pair        : VSX pairing (new pair) or full teardown (`delete=true`)
+      l3_link         : routed P2P link + optional VRF/OSPF, single or batched
+                        (`links=[...]`)
+      access_port     : L2 access port(s) + STP + 802.1X in one call
+      static_vxlan    : VTEP + VLAN/VNI maps + static peers (no EVPN) — legacy,
+                        prefer `overlay` + `overlay_service` for a fabric VTEP
+      evpn_vlan       : ONE EVPN VLAN service with explicit RD/RT — legacy,
+                        prefer `overlay_service` (batch, `attach` modes)
+      radius_dot1x    : RADIUS server(s) + group + global AAA + per-port 802.1X
+      overlay         : device-level VXLAN interface + (mode=evpn|stub) global
+                        EVPN + virtual-MAC + optional BGP-EVPN control-plane;
+                        mode=static (Extended Edge) stops after the interface
+      overlay_service : BATCH VLAN -> L2VNI -> EVPN route-target and/or static
+                        peer (`attach`='evpn'|'static'|'stub' per entry);
+                        requires `overlay` to have run first on the target
+
+    `action`: 'plan' (preview, returns `dry_run_token`) | 'apply' (requires
+    that token) | 'verify' (read-back via the paired verify_* function).
+    Each apply runs inside a firmware auto-checkpoint (auto-revert on
+    failure; opt out with `auto_checkpoint=false`). `force=true` overrides
+    the CX_PROTECTED_OBJECTS guard. `orchestrate_fabric_underlay` and
+    `orchestrate_fabric_overlay` are NOT reachable here (their `spines`/
+    `leafs` lists replace device/site entirely) — call them directly."""
+    entry = _MAP_ORCHESTRATORS.get(name)
+    if not entry:
+        return {"error": f"[orchestrator] unknown name '{name}'",
+                "valid_names": sorted(_MAP_ORCHESTRATORS)}
+    cfg_name, verify_name = entry
+    base = dict(params or {})
+    if action == "verify":
+        if not verify_name:
+            return {"error": f"[orchestrator] no verify action for '{name}'"}
+        fn = getattr(_SRV, verify_name, None)
+        if fn is None:
+            return {"error": f"[orchestrator] verify function '{verify_name}' not found"}
+        call = _filtered_kwargs(fn, dict(base, site=site))
+        return await fn(device=device, site=site, **{k: v for k, v in call.items()
+                                                     if k != "site"})
+    if action not in ("plan", "apply"):
+        return {"error": f"[orchestrator] invalid action '{action}'",
+                "valid_actions": ["plan", "apply", "verify"]}
+    fn = getattr(_SRV, cfg_name, None)
+    if fn is None:
+        return {"error": f"[orchestrator] function '{cfg_name}' not found"}
+    call = _filtered_kwargs(fn, dict(base, site=site))
+    result = await _guarded_write(cfg_name, fn, device, call,
+                                  action == "apply", dry_run_token, force,
+                                  auto_checkpoint, verbose)
+    return _flag_ignored_params(result, base, call, name)
 
 
 async def diagnose(device: "str | list[str]" = None, scope: str = "device",
@@ -732,13 +1250,17 @@ _DISPATCHERS: list[Callable] = [
     manage_inventory, get_system, get_interfaces, get_switching, get_routing,
     get_overlay, get_redundancy, get_access, get_automation, get_apps, get_config,
     configure_interface, configure_routing, configure_security, configure_service,
-    diagnose, troubleshoot,
+    configure_redundancy, orchestrator, diagnose, troubleshoot,
 ]
 
 # Legacy atomic tools that stay advertised as-is (never de-advertised).
 _KEEP_ATOMIC: set[str] = {
     "list_devices", "list_sites", "get_logs", "run_ssh_commands",
     "manage_config", "backup_config", "logout", "rollback",
+    # Doesn't fit the single-device configure_*(scope=...) generic dispatch
+    # model (_guarded_write always calls fn(device=..., **call)) — it takes
+    # `spines`/`leafs` device LISTS instead of one `device`/`site` target.
+    "orchestrate_fabric_underlay", "orchestrate_fabric_overlay",
 }
 
 

@@ -40,11 +40,42 @@ from tools.tools_config import *  # noqa: F401,F403
 from tools.tools_service import *  # noqa: F401,F403
 from tools.tools_configure import *  # noqa: F401,F403
 from tools.tools_verify import *  # noqa: F401,F403
+from tools.tools_orchestrate import *  # noqa: F401,F403
 from tools.prompts import *  # noqa: F401,F403
 
 # ══════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════
+
+class _HealthMiddleware:
+    """GET /healthz → JSON health snapshot (no auth: it carries no secrets and
+    must stay reachable for the Docker HEALTHCHECK / load balancer). 200 when
+    the server can serve, 503 when LOCKED (auth on, 0 tokens) or the inventory
+    is empty. Everything else falls through to the MCP app."""
+
+    def __init__(self, app, path: str = "/healthz"):
+        self._app = app
+        self._path = path
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == self._path:
+            if scope.get("method") not in ("GET", "HEAD"):
+                status, body = 405, {"error": "method not allowed"}
+            else:
+                try:
+                    status, body = server_core.health_snapshot()
+                except Exception as exc:  # noqa: BLE001 — health must never crash
+                    status, body = 500, {"status": "error", "error": str(exc)}
+            payload = json.dumps(body).encode("utf-8")
+            await send({"type": "http.response.start", "status": status,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"cache-control", b"no-store"),
+                                    (b"content-length", str(len(payload)).encode())]})
+            await send({"type": "http.response.body",
+                        "body": b"" if scope.get("method") == "HEAD" else payload})
+            return
+        await self._app(scope, receive, send)
+
 
 class _StaleSessionMiddleware:
     """Log a warning when a client POSTs with an mcp-session-id that no longer exists on this server."""
@@ -143,7 +174,7 @@ class _SecurityMiddleware:
         if audit_on and method == "POST":
             body = await self._read_body(receive)
             info = self._parse_tool_call(body)
-            receive = self._replay(body)
+            receive = self._replay(body, receive)
             if info is not None:
                 start = time.perf_counter()
                 captured: dict = {"code": None}
@@ -206,7 +237,15 @@ class _SecurityMiddleware:
         return b"".join(chunks)
 
     @staticmethod
-    def _replay(body: bytes):
+    def _replay(body: bytes, original_receive):
+        """Re-deliver the already-consumed body once, then fall back to the
+        REAL ``receive`` for any further call. The streamable-http session can
+        legitimately call ``receive()`` again while streaming its response (to
+        detect an actual client disconnect); fabricating a fake
+        ``http.disconnect`` there (as opposed to delegating to the original
+        callable) made the session think the client had already hung up and
+        abort the response before writing any body — breaking every request
+        while audit logging was enabled."""
         sent = False
 
         async def receive():
@@ -214,7 +253,7 @@ class _SecurityMiddleware:
             if not sent:
                 sent = True
                 return {"type": "http.request", "body": body, "more_body": False}
-            return {"type": "http.disconnect"}
+            return await original_receive()
 
         return receive
 
@@ -281,10 +320,12 @@ class _SecurityMiddleware:
 async def rollback(rollback_id: str) -> dict:
     """Undo a previously applied, reversible write by its `rollback_id`.
 
-    A `rollback_id` is returned by `apply_plan` after applying a reversible plan
-    (currently the VLAN-service provisioning workflow). The inverse actions are
-    replayed last-created-first. Idempotent config merges (most `configure_*`
-    tools) have no automatic inverse and are reported as 'unsupported'.
+    A `rollback_id` is returned by every successful apply (flat configure_*
+    dispatchers, configure_service, apply_plan). The inverse actions are
+    replayed last-created-first. Covered: the VLAN-service steps and every
+    object a configure_* apply CREATED (loopback, VRF, L3 VNI). Updates of
+    pre-existing objects have no automatic inverse and are reported as
+    'unsupported' — use manage_config(action='restore_checkpoint') for those.
     """
     if write_safety is None or not write_safety.enabled:
         return {"ok": False, "error": "write safety is disabled"}
@@ -303,6 +344,12 @@ async def rollback(rollback_id: str) -> dict:
                 return await client.delete_vlan(args["vlan"])
             if inverse == "remove_vlan_from_trunk":
                 return await client.remove_vlan_from_trunk(args["interface"], args["vlan"])
+            if inverse == "delete_interface":
+                return await client.delete_interface(args["interface"])
+            if inverse == "delete_vni":
+                return await client.delete_vni(args["vni"])
+            if inverse == "delete_vrf":
+                return await client.delete_vrf(args["vrf"])
             raise ValueError(f"no executor for inverse action: {inverse}")
 
     try:
@@ -364,6 +411,7 @@ if __name__ == "__main__":
                 mcp_path=_MCP_PATH,
                 trust_forwarded=_TRUST_FORWARDED,
             )
+            app = _HealthMiddleware(app)
 
             # Manual hot reload on SIGHUP: reload tokens + inventory without a
             # restart. Triggered from inside the container by `python cx_reload.py`.
@@ -385,9 +433,10 @@ if __name__ == "__main__":
                 while not uvi_server.started:
                     await asyncio.sleep(0.1)
                 logger.info(
-                    "✅ hpe-cx-mcp server is up and running on http://%s:%s — "
+                    "✅ hpe-cx-mcp %s is up and running on http://%s:%s (health: /healthz) — "
                     "if your agent already has an open MCP connection, reset it "
                     "(MCP: Disconnect → Connect) to pick up the current tools.",
+                    server_core.__version__,
                     _host,
                     _port,
                 )

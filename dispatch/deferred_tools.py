@@ -122,10 +122,23 @@ _META: set[str] = {"search_tools", "invoke_tool", "apply_plan"}
 # ──────────────────────────────────────────────────────────────────────
 
 WRITE_TOOLS: set[str] = {
-    "configure_loopback", "configure_routed_port", "configure_vxlan_interface",
+    "configure_loopback", "configure_routed_port", "configure_lag",
+    "configure_vxlan_interface",
     "configure_evpn", "configure_ospf", "configure_bgp", "configure_vrf",
     "configure_port_auth", "configure_app_recognition", "configure_virtual_mac",
     "configure_aaa", "configure_user_roles",
+    "configure_vlan", "configure_svi", "configure_trunk",
+    "configure_interface_admin", "configure_static_route",
+    "configure_redistribute", "configure_vsx", "configure_dhcp_relay",
+    "configure_interface_group",
+    "configure_hostname",
+    "orchestrate_vsx_pair", "orchestrate_l3_link", "orchestrate_access_port",
+    "orchestrate_radius_dot1x",
+    "orchestrate_evpn_vlan",
+    "orchestrate_static_vxlan",
+    "orchestrate_overlay",
+    "orchestrate_overlay_service",
+    "orchestrate_fabric_underlay", "orchestrate_fabric_overlay",
     "run_ssh_commands", "refresh_inventory",
     "backup_config",
 }
@@ -211,6 +224,8 @@ TOOL_TAGS: dict[str, list[str]] = {
     # Writes — configure_*
     "configure_loopback": ["interfaces", "loopback", "l3", "write"],
     "configure_routed_port": ["interfaces", "routed", "l3", "write"],
+    "configure_lag": ["interfaces", "lag", "lacp", "mclag", "multi-chassis",
+                      "evpn-multihoming", "esi", "port-channel", "write"],
     "configure_vxlan_interface": ["overlay", "vxlan", "vtep", "stub-vtep", "static", "write"],
     "configure_evpn": ["overlay", "evpn", "write"],
     "configure_ospf": ["routing", "ospf", "write"],
@@ -221,9 +236,38 @@ TOOL_TAGS: dict[str, list[str]] = {
     "configure_virtual_mac": ["redundancy", "vsx", "virtual-mac", "write"],
     "configure_aaa": ["security", "aaa", "radius", "tacacs", "write"],
     "configure_user_roles": ["security", "user-roles", "gbp", "abp", "write"],
+    "configure_vlan": ["switching", "vlan", "write"],
+    "configure_svi": ["interfaces", "svi", "vlan", "l3", "write"],
+    "configure_trunk": ["interfaces", "trunk", "vlan", "l2", "write"],
+    "configure_interface_admin": ["interfaces", "admin", "shutdown", "write"],
+    "configure_static_route": ["routing", "static-route", "write"],
+    "configure_redistribute": ["routing", "bgp", "ospf", "redistribute", "write"],
+    "configure_vsx": ["redundancy", "vsx", "pairing", "write"],
+    "configure_dhcp_relay": ["interfaces", "dhcp", "dhcp-relay", "helper-address", "write"],
+    "configure_interface_group": ["interfaces", "interface-group", "port-group", "speed", "write"],
+    "configure_hostname": ["system", "hostname", "write"],
+    "orchestrate_vsx_pair": ["redundancy", "vsx", "pair", "isl", "keepalive", "orchestrator", "write"],
+    "orchestrate_l3_link": ["interfaces", "routed", "l3", "vrf", "ospf", "orchestrator", "write"],
+    "orchestrate_access_port": ["interfaces", "access", "stp", "bpdu-guard", "dot1x", "orchestrator", "write"],
+    "orchestrate_radius_dot1x": ["security", "radius", "dot1x", "mac-auth", "coa", "orchestrator", "write"],
+    "orchestrate_evpn_vlan": ["overlay", "evpn", "vxlan", "l2vni", "vlan", "svi", "rd", "rt", "orchestrator", "write"],
+    "verify_evpn_vlan": ["verify", "overlay", "evpn", "vxlan", "l2vni", "vlan"],
+    "orchestrate_static_vxlan": ["overlay", "vxlan", "static", "vtep", "l2vni", "peers", "orchestrator", "write"],
+    "verify_static_vxlan": ["verify", "overlay", "vxlan", "static", "vtep"],
+    "orchestrate_overlay": ["overlay", "vxlan", "vtep", "evpn", "virtual-mac", "bgp-evpn", "stub-vtep", "extended-edge", "orchestrator", "write"],
+    "verify_overlay": ["verify", "overlay", "vxlan", "vtep", "evpn", "virtual-mac"],
+    "orchestrate_overlay_service": ["overlay", "evpn", "vxlan", "l2vni", "vlan", "svi", "batch", "stub-vtep", "orchestrator", "write"],
+    "orchestrate_fabric_underlay": ["fabric", "underlay", "ospf", "loopback", "p2p", "spine", "leaf", "orchestrator", "write"],
+    "orchestrate_fabric_overlay": ["fabric", "overlay", "bgp", "evpn", "route-reflector", "spine", "leaf", "orchestrator", "write"],
+    "verify_overlay_service": ["verify", "overlay", "evpn", "vxlan", "l2vni", "vlan", "batch"],
     # Verifies — verify_*
     "verify_loopback": ["verify", "interfaces", "loopback"],
     "verify_routed_port": ["verify", "interfaces", "routed"],
+    "verify_hostname": ["verify", "system", "hostname"],
+    "verify_access_port": ["verify", "interfaces", "access", "stp", "dot1x"],
+    "verify_radius_dot1x": ["verify", "security", "radius", "dot1x", "coa"],
+    "verify_vsx_cluster": ["verify", "redundancy", "vsx", "pair"],
+    "verify_lag": ["verify", "interfaces", "lag", "lacp", "mclag", "esi"],
     "verify_vxlan_interface": ["verify", "overlay", "vxlan", "stub-vtep"],
     "verify_evpn": ["verify", "overlay", "evpn"],
     "verify_ospf": ["verify", "routing", "ospf"],
@@ -234,6 +278,17 @@ TOOL_TAGS: dict[str, list[str]] = {
     "verify_virtual_mac": ["verify", "redundancy", "vsx"],
     "verify_aaa": ["verify", "security", "aaa", "radius", "tacacs"],
     "verify_user_roles": ["verify", "security", "user-roles", "gbp", "abp"],
+    "verify_vlan": ["verify", "switching", "vlan"],
+    "verify_svi": ["verify", "interfaces", "svi"],
+    "verify_trunk": ["verify", "interfaces", "trunk"],
+    "verify_interface_admin": ["verify", "interfaces", "admin"],
+    "verify_static_route": ["verify", "routing", "static-route"],
+    "verify_redistribute": ["verify", "routing", "redistribute"],
+    "verify_vsx": ["verify", "redundancy", "vsx"],
+    "verify_dhcp_relay": ["verify", "interfaces", "dhcp", "dhcp-relay"],
+    "get_dhcp_relay": ["interfaces", "dhcp", "dhcp-relay", "helper-address"],
+    "verify_interface_group": ["verify", "interfaces", "interface-group", "port-group", "speed"],
+    "get_interface_groups": ["interfaces", "interface-group", "port-group", "speed"],
 }
 
 
@@ -540,8 +595,9 @@ async def _apply_plan(dry_run_token: str) -> dict:
     rollback_id = None
     if isinstance(applied, dict) and applied.get("status") in ("applied", "partial"):
         try:
-            targets = list(fresh_plan.keys()) if isinstance(fresh_plan, dict) else []
-            rollback_id = _ws.record(tool, targets, fresh_plan or {})
+            plan = applied.get("reversible") or fresh_plan or {}
+            targets = list(plan.keys()) if isinstance(plan, dict) else []
+            rollback_id = _ws.record(tool, targets, plan)
             if rollback_id:
                 applied["rollback_id"] = rollback_id
         except Exception:

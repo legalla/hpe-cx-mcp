@@ -19,15 +19,16 @@ async def get_vlans(device: str, vlan_id: int = None) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def get_lldp_neighbors(device: str) -> dict:
+async def get_lldp_neighbors(device: str, interface: str = None) -> dict:
     """Discover directly-connected neighbors via LLDP — THE tool to build a
     physical topology / cabling map or answer "what is connected to this switch".
     Returns, per local interface, the neighbor's system name (chassis_name),
     description (chassis_description), chassis id, remote port id/description,
-    management IPs and advertised VLANs. For a whole site at once, prefer
-    run_on_site(operation='get_lldp_neighbors'). Not related to system logs."""
+    management IPs and advertised VLANs. `interface` restricts to one local
+    port. For a whole site at once, prefer run_on_site(operation=
+    'get_lldp_neighbors'). Not related to system logs."""
     async with _get_client(device) as client:
-        return await client.get_lldp_neighbors()
+        return await client.get_lldp_neighbors(interface=interface)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -41,6 +42,30 @@ async def get_routing_table(device: str, vrf: str = "default") -> dict:
     protocol."""
     async with _get_client(device) as client:
         return await client.get_routing_table(vrf)
+
+
+@mcp.tool()
+async def get_dhcp_relay(device: str, interface: str = None) -> dict:
+    """DHCP relay (helper-address) config. Omit `interface` to discover ALL
+    configured relays on the device (each with its VRF/port/server list);
+    provide it to check a single L3 port/SVI. Pair with configure_dhcp_relay."""
+    async with _get_client(device) as client:
+        relays = await client.list_dhcp_relays(interface)
+        return {"device": device, "relays": relays, "count": len(relays)}
+
+
+@mcp.tool()
+async def get_interface_groups(device: str, subsystem: str = None) -> dict:
+    """Interface (port-group) speed settings — the CLI `show interface-group`.
+    Each group lists its configured / applied / default speed and the speeds it
+    supports. Interface groups are blocks of ports on a subsystem (line card /
+    chassis) that share one selectable link speed (e.g. 10g OR 25g, not both).
+    Omit `subsystem` to list every group on the device; provide it
+    ('line_card,1/1' or bare '1/1') to scope to one. Pair with
+    configure_interface_group. Empty on platforms without interface groups."""
+    async with _get_client(device) as client:
+        groups = await client.list_interface_groups(subsystem)
+        return {"device": device, "interface_groups": groups, "count": len(groups)}
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -63,8 +63,8 @@ async def get_full_config(device: str, name: str = "running-config") -> dict:
 
 @mcp.tool()
 async def manage_config(
-    device: str,
-    action: str,
+    device: str = None,
+    action: str = None,
     name: str = None,
     source: str = "running-config",
     target: str = "running-config",
@@ -74,8 +74,13 @@ async def manage_config(
     config_b: str = None,
     minutes: int = 10,
     mode: str = None,
+    site: str = None,
 ) -> dict:
     """Config management (checkpoints, backup, copy, restore, diff).
+    `device` accepts ONE name, a COMMA-SEPARATED string ('A,B,C') or a list;
+    `site` targets a whole site — the action runs on every target in ONE call
+    (e.g. a single `write_memory` for 6 switches). With several targets the
+    result is {status, targets, results{dev: ...}, summary}.
     `action`:
       - list_checkpoints: list the checkpoints (date, age, author, version).
       - write_memory: running-config → startup-config ("write memory").
@@ -96,38 +101,43 @@ async def manage_config(
         "auto_checkpoint",
         "confirm",
     }
-    if action in write_actions and not _device_can_write(device):
-        return _deny_read_only(device, f"manage_config:{action}")
-    async with _get_client(device) as client:
-        if action == "list_checkpoints":
-            return await client.list_checkpoints()
+    available = [
+        "list_checkpoints", "write_memory", "create_checkpoint", "copy_config",
+        "restore_checkpoint", "auto_checkpoint", "confirm", "diff",
+    ]
+    if action not in available:
+        return {"status": "error", "error": f"Unknown action: '{action}'.",
+                "available_actions": available}
+    if action == "create_checkpoint" and not name:
+        return {"status": "error", "error": "The 'name' parameter (checkpoint name) is required."}
+    if action == "copy_config" and (not from_config or not to_config):
+        return {"status": "error",
+                "error": "The 'from_config' and 'to_config' parameters are required."}
+    if action == "restore_checkpoint" and not name:
+        return {"status": "error", "error": "The 'name' parameter (checkpoint to restore) is required."}
+    try:
+        device_names = _resolve_devices(device=device, site=site)
+    except ValueError as exc:
+        return {"status": "invalid_input", "error": str(exc)}
 
-        if action == "write_memory":
-            return await client.save_config()
-
-        if action == "create_checkpoint":
-            if not name:
-                return {"status": "error", "error": "The 'name' parameter (checkpoint name) is required."}
-            return await client.create_checkpoint(name=name, source=source)
-
-        if action == "copy_config":
-            if not from_config or not to_config:
-                return {"status": "error",
-                        "error": "The 'from_config' and 'to_config' parameters are required."}
-            return await client.copy_config(from_config=from_config, to_config=to_config)
-
-        if action == "restore_checkpoint":
-            if not name:
-                return {"status": "error", "error": "The 'name' parameter (checkpoint to restore) is required."}
-            return await client.restore_checkpoint(name=name, target=target)
-
-        if action == "auto_checkpoint":
-            return await client.set_auto_checkpoint(minutes=minutes)
-
-        if action == "confirm":
-            return await client.confirm_auto_checkpoint()
-
-        if action == "diff":
+    async def _one(dev: str) -> dict:
+        if action in write_actions and not _device_can_write(dev):
+            return _deny_read_only(dev, f"manage_config:{action}")
+        async with _get_client(dev) as client:
+            if action == "list_checkpoints":
+                return await client.list_checkpoints()
+            if action == "write_memory":
+                return await client.save_config()
+            if action == "create_checkpoint":
+                return await client.create_checkpoint(name=name, source=source)
+            if action == "copy_config":
+                return await client.copy_config(from_config=from_config, to_config=to_config)
+            if action == "restore_checkpoint":
+                return await client.restore_checkpoint(name=name, target=target)
+            if action == "auto_checkpoint":
+                return await client.set_auto_checkpoint(minutes=minutes)
+            if action == "confirm":
+                return await client.confirm_auto_checkpoint()
             a = config_a or "running-config"
             b = config_b or "startup-config"
             if mode == "deep":
@@ -135,14 +145,28 @@ async def manage_config(
                 return await client.get_config(name=a, diff=client._uri(f"/configs/{b}"), mode="deep")
             return await client.compare_configs(config_a=a, config_b=b)
 
-        return {
-            "status": "error",
-            "error": f"Unknown action: '{action}'.",
-            "available_actions": [
-                "list_checkpoints", "write_memory", "create_checkpoint", "copy_config",
-                "restore_checkpoint", "auto_checkpoint", "confirm", "diff",
-            ],
-        }
+    if len(device_names) == 1:
+        return await _one(device_names[0])
+
+    async def _safe(dev: str) -> tuple[str, dict]:
+        try:
+            res = await _one(dev)
+            ok = not (isinstance(res, dict) and res.get("status") in ("error", "forbidden"))
+            return dev, {"ok": ok, "result": res}
+        except Exception as exc:  # noqa: BLE001 - one target must not stop the batch
+            return dev, {"ok": False, "error": str(exc)}
+
+    results = dict(await asyncio.gather(*[_safe(d) for d in device_names]))
+    failed = [d for d, r in results.items() if not r["ok"]]
+    return {
+        "status": "ok" if not failed else "partial",
+        "action": action,
+        "targets": device_names,
+        "results": results,
+        "summary": {"total": len(device_names),
+                    "succeeded": len(device_names) - len(failed),
+                    "failed": len(failed), "failed_devices": failed},
+    }
 
 
 @mcp.tool()

@@ -8,7 +8,7 @@ covers the need.
 import os
 
 from clients.aruba_client import ArubaOSCXClient
-from clients.ssh_client import ArubaSSHError
+from clients.ssh_client import ArubaSSHError, cli_error
 from core.server_core import (
     mcp, _get_client, _ssh_exec, _device_can_write, _deny_read_only,
     _is_ssh_write_command,
@@ -58,7 +58,8 @@ def _ssh_redirect_payload(tool: str, command: str) -> dict:
 
 
 @mcp.tool()
-async def run_ssh_command(device: str, command: str, force: bool = False) -> dict:
+async def run_ssh_command(device: str, command: str, force: bool = False,
+                          auto_confirm: bool = False) -> dict:
     """FALLBACK ONLY — use a dedicated tool if one exists, INCLUDING Tier-2 tools
     (discover them first with `search_tools`, then run them via `invoke_tool`).
     Only when no specific tool covers the need, run an arbitrary CLI command
@@ -66,7 +67,9 @@ async def run_ssh_command(device: str, command: str, force: bool = False) -> dic
     hatches, PREFER this over `run_cli_command` (the /cli REST path is limited).
     If the command is covered by a dedicated tool, this is REFUSED and you are
     redirected to that tool (pass force=true to override). Pagination disabled
-    automatically. Call `logout` at the end."""
+    automatically. An interactive '(y/n)' prompt is answered 'n' (command not
+    applied, ok=false) unless `auto_confirm=true`. CLI error messages
+    (Invalid input, Command incomplete...) return ok=false. Call `logout` at the end."""
     if _SSH_TOOL_REDIRECT and not force:
         tool = _dedicated_tool_for(command)
         if tool:
@@ -90,22 +93,48 @@ async def run_ssh_command(device: str, command: str, force: bool = False) -> dic
             }
     except ValueError as exc:
         return {"device": device, "command": command, "ok": False, "error": str(exc)}
+    confirmations: list = []
+
+    async def _run(c):
+        out = await c.run_command(command, auto_confirm=auto_confirm)
+        confirmations.extend(c.last_confirmations)
+        return out
     try:
-        output = await _ssh_exec(device, lambda c: c.run_command(command))
+        output = await _ssh_exec(device, _run)
     except (ArubaSSHError, ValueError) as exc:
         return {"device": device, "command": command, "ok": False, "error": str(exc)}
-    return {"device": device, "command": command, "ok": True, "output": output}
+    res = {"device": device, "command": command, "ok": True, "output": output}
+    if confirmations:
+        res["confirmations"] = confirmations
+    declined = [c for c in confirmations if c["answer"] != "y"]
+    err = cli_error(output)
+    if declined:
+        res.update(ok=False, error=f"interactive confirmation declined ('{declined[0]['prompt']}') "
+                                   "— command NOT applied; re-run with auto_confirm=true")
+    elif err:
+        res.update(ok=False, error=f"CLI error: {err}")
+    return res
 
 
 @mcp.tool()
-async def run_ssh_commands(device: str, commands: list[str], force: bool = False) -> dict:
+async def run_ssh_commands(device: str, commands: list[str], force: bool = False,
+                           auto_confirm: bool = False, stop_on_error: bool = True) -> dict:
     """FALLBACK ONLY — use a dedicated tool if one exists, INCLUDING Tier-2 tools
     (discover them with `search_tools`, then run them via `invoke_tool`). Batch
     variant of `run_ssh_command`: only when no specific tool covers the need, run
     several CLI commands via SSH within a single session. Commands covered by a
     dedicated tool are REFUSED and redirected to that tool (pass force=true to
-    override). Each command returns {command, output, ok, error}. Call `logout`
-    at the end."""
+    override). Each command returns {command, output, ok, executed, error}.
+    - interactive '(y/n)' prompts (e.g. `shutdown` on vxlan1,
+      `inter-vxlan-bridging-mode`) are answered 'y' with `auto_confirm=true`,
+      otherwise 'n' (that command is NOT applied and is ok=false) — the
+      session never hangs on them.
+    - a CLI error in the output (Invalid input, Command incomplete, '... is
+      not configured') makes that command ok=false.
+    - `stop_on_error` (default true): after the first failed command the
+      remaining ones are NOT sent (`executed: false`, listed in
+      summary.not_executed) — avoids applying the rest of a config sequence
+      on a half-configured object. Call `logout` at the end."""
     if not commands:
         return {"device": device, "ok": False, "error": "No command provided.", "results": []}
     if _SSH_TOOL_REDIRECT and not force:
@@ -139,19 +168,23 @@ async def run_ssh_commands(device: str, commands: list[str], force: bool = False
     except ValueError as exc:
         return {"device": device, "ok": False, "error": str(exc), "results": []}
     try:
-        results = await _ssh_exec(device, lambda c: c.run_commands(commands))
+        results = await _ssh_exec(device, lambda c: c.run_commands(
+            commands, auto_confirm=auto_confirm, stop_on_error=stop_on_error))
     except (ArubaSSHError, ValueError) as exc:
-        return {"device": device, "ok": False, "error": str(exc), "results": []}
-    failed = [r["command"] for r in results if not r["ok"]]
+        return {"device": device, "ok": False, "error": str(exc), "results": [],
+                "summary": {"total": len(commands), "not_executed": list(commands)}}
+    failed = [r["command"] for r in results if not r["ok"] and r.get("executed", True)]
+    skipped = [r["command"] for r in results if not r.get("executed", True)]
     return {
         "device": device,
-        "ok": not failed,
+        "ok": not failed and not skipped,
         "results": results,
         "summary": {
             "total": len(results),
-            "succeeded": len(results) - len(failed),
+            "succeeded": len(results) - len(failed) - len(skipped),
             "failed": len(failed),
             "failed_commands": failed,
+            "not_executed": skipped,
         },
     }
 

@@ -86,16 +86,44 @@ class _TofuSSHClient(asyncssh.SSHClient):
             return False
         return True
 
-# ArubaOS-CX prompt at the end of the buffer: 'switch#', 'switch>', 'switch(config)#'…
-_PROMPT_RE = re.compile(r"[\r\n][A-Za-z0-9._\-]+(\([A-Za-z0-9._\-]+\))?[#>]\s*$")
+# ArubaOS-CX prompt at the end of the buffer: 'switch#', 'switch>', 'switch(config)#',
+# 'switch(config-if-1/1/1)#', 'switch(config-if-<1/1/1-1/1/24>)#', 'switch(config-vlan-10)#'…
+# The parenthesised mode may contain '/', '<', '>', '-', ',' so accept anything but ')'.
+_PROMPT_RE = re.compile(r"[\r\n][A-Za-z0-9._\-]+(\([^()\r\n]*\))?[#>]\s*$")
 # A line that is ONLY the prompt (used to clean up the end of the output).
-_PROMPT_ONLY_RE = re.compile(r"^[A-Za-z0-9._\-]+(\([A-Za-z0-9._\-]+\))?[#>]\s*$")
+_PROMPT_ONLY_RE = re.compile(r"^[A-Za-z0-9._\-]+(\([^()\r\n]*\))?[#>]\s*$")
+# Short read used to re-synchronise the channel after a prompt timeout.
+_RESYNC_TIMEOUT = 3.0
 # Residual paging marker (safety net if `no page` fails).
 _MORE_RE = re.compile(r"--+\s*more\s*--+", re.IGNORECASE)
+# Interactive confirmation at the end of the buffer, e.g. 'Do you want to
+# continue (y/n)?' (shutdown of vxlan1, inter-vxlan-bridging-mode, ...).
+_CONFIRM_RE = re.compile(r"(\(y/n\)|\[y/n\]|\(yes/no\)|\[yes/no\])\s*[?:]?\s*$", re.IGNORECASE)
+# CLI error lines: printed in place of the output, so only the first lines are
+# checked (a 'show' table may legitimately contain these words further down).
+_CLI_ERROR_RE = re.compile(
+    r"^\s*%?\s*(Invalid input|Command incomplete|Incomplete command|Ambiguous command|"
+    r"Unknown command|Error\b|ERROR\b|.*\bis not configured\b|.*\balready configured with\b|"
+    r".*\bdoes not exist\b|Cannot\b|Unable to\b)",
+    re.IGNORECASE)
+_CLI_ERROR_LINES = 3
+
+
+def cli_error(output: str) -> str | None:
+    """The CLI error message in `output`, or None when it looks successful."""
+    lines = [l.strip() for l in (output or "").splitlines() if l.strip()]
+    for line in lines[:_CLI_ERROR_LINES]:
+        if _CLI_ERROR_RE.match(line):
+            return line
+    return None
 
 
 class ArubaSSHError(Exception):
     """SSH connection or execution error on an ArubaOS-CX device."""
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
 
 
 def _strip_ansi(text: str) -> str:
@@ -122,6 +150,8 @@ class ArubaOSCXSSHClient:
         self._process: asyncssh.SSHClientProcess | None = None
         self._closed = True
         self._lock: asyncio.Lock | None = None
+        # confirmation prompts met by the last run_command: [{prompt, answer}]
+        self.last_confirmations: list[dict] = []
 
     @property
     def is_connected(self) -> bool:
@@ -175,18 +205,23 @@ class ArubaOSCXSSHClient:
                     f"SSH connection to {self.host}:{self.port} failed: {exc}"
                 ) from exc
 
-    async def _read_until_prompt(self, timeout: float | None = None) -> str:
-        """Read output until the prompt is detected (or the timeout expires)."""
+    async def _read_until_prompt(self, timeout: float | None = None,
+                                 confirm: str | None = None) -> str:
+        """Read output until the prompt is detected (or the timeout expires).
+        A '(y/n)' confirmation is answered with `confirm` ('y' / 'n') so the
+        session never hangs on it; None leaves it unanswered (old behaviour)."""
         assert self._process is not None
         loop = asyncio.get_event_loop()
         timeout = timeout if timeout is not None else self.timeout
         deadline = loop.time() + timeout
         buf = ""
+        answered_at = 0
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise ArubaSSHError(
-                    f"Timed out waiting for the prompt on {self.host}."
+                    f"Timed out waiting for the prompt on {self.host}.",
+                    partial=_strip_ansi(buf),
                 )
             try:
                 chunk = await asyncio.wait_for(
@@ -194,7 +229,8 @@ class ArubaOSCXSSHClient:
                 )
             except asyncio.TimeoutError:
                 raise ArubaSSHError(
-                    f"Timed out waiting for the prompt on {self.host}."
+                    f"Timed out waiting for the prompt on {self.host}.",
+                    partial=_strip_ansi(buf),
                 )
             if chunk == "":  # EOF: the session was closed on the device side
                 self._closed = True
@@ -204,6 +240,13 @@ class ArubaOSCXSSHClient:
             # Safety net if paging stayed active.
             if _MORE_RE.search(clean.rstrip()[-20:]):
                 self._process.stdin.write(" ")
+                continue
+            if confirm and _CONFIRM_RE.search(clean[answered_at:]):
+                tail = clean[answered_at:].strip().splitlines()
+                self.last_confirmations.append(
+                    {"prompt": tail[-1] if tail else "", "answer": confirm})
+                self._process.stdin.write(confirm + "\n")
+                answered_at = len(clean)
                 continue
             if _PROMPT_RE.search(clean):
                 break
@@ -225,19 +268,29 @@ class ArubaOSCXSSHClient:
             lines.pop()
         return "\n".join(lines)
 
-    async def run_command(self, command: str) -> str:
-        """Send a CLI command and return its cleaned output."""
+    async def run_command(self, command: str, *, auto_confirm: bool = False) -> str:
+        """Send a CLI command and return its cleaned output. An interactive
+        '(y/n)' prompt is answered 'y' with `auto_confirm`, otherwise 'n' (the
+        command is then NOT applied — see `last_confirmations`)."""
         if self._process is None or self._closed:
             raise ArubaSSHError(
                 f"SSH session not connected to {self.host}. Call connect()."
             )
+        self.last_confirmations = []
         try:
             self._process.stdin.write(command + "\n")
-            raw = await self._read_until_prompt()
-        except ArubaSSHError:
-            # A prompt timeout leaves the channel desynchronized (the late output
-            # would be read by the next command). Invalidate the session so it is
-            # not reused: the pool will reconnect a fresh one on the next call.
+            raw = await self._read_until_prompt(confirm="y" if auto_confirm else "n")
+        except ArubaSSHError as exc:
+            # A prompt timeout may leave the channel desynchronized (late output
+            # would be read by the next command). Try to resync with a bare
+            # newline first; only invalidate the session if that fails too.
+            if not self._closed and await self._resync():
+                raise ArubaSSHError(
+                    f"Timed out waiting for the prompt on {self.host} after '{command}' "
+                    f"(session resynchronised, kept open). Partial output: "
+                    f"{exc.partial.strip()[-500:]!r}",
+                    partial=exc.partial,
+                ) from exc
             self._closed = True
             raise
         except (asyncssh.Error, OSError) as exc:
@@ -247,32 +300,64 @@ class ArubaOSCXSSHClient:
             ) from exc
         return self._clean_output(command, raw)
 
-    async def run_commands(self, commands: list[str]) -> list[dict]:
+    async def _resync(self) -> bool:
+        """Send a bare newline and check a prompt comes back quickly."""
+        try:
+            self._process.stdin.write("\n")
+            await self._read_until_prompt(timeout=_RESYNC_TIMEOUT)
+            return not self._closed
+        except (ArubaSSHError, asyncssh.Error, OSError):
+            return False
+
+    async def run_commands(self, commands: list[str], *, auto_confirm: bool = False,
+                           stop_on_error: bool = False) -> list[dict]:
         """Run a list of commands within the same SSH session.
 
-        Returns a list of dicts {command, output, ok, error}. If a command
-        breaks the session, the following ones are marked as errored.
+        Returns a list of dicts {command, output, ok, error, executed}. A CLI
+        error message in the output (Invalid input, Command incomplete, ...)
+        or a declined confirmation makes the command `ok: false`. If the
+        session breaks (or `stop_on_error` and a command fails), the following
+        commands are NOT sent and are marked `executed: false`.
         """
         results: list[dict] = []
+        abort_reason = None
         for command in commands:
-            if self._closed:
+            if abort_reason or self._closed:
                 results.append({
                     "command": command,
                     "ok": False,
+                    "executed": False,
                     "output": "",
-                    "error": "SSH session closed before execution.",
+                    "error": f"not executed: {abort_reason or 'SSH session closed'}",
                 })
                 continue
             try:
-                output = await self.run_command(command)
-                results.append({"command": command, "ok": True, "output": output})
+                output = await self.run_command(command, auto_confirm=auto_confirm)
             except ArubaSSHError as exc:
                 results.append({
                     "command": command,
                     "ok": False,
-                    "output": "",
+                    "executed": True,
+                    "output": exc.partial or "",
                     "error": str(exc),
                 })
+                if self._closed or stop_on_error:
+                    abort_reason = f"previous command '{command}' failed"
+                continue
+            entry = {"command": command, "ok": True, "executed": True, "output": output}
+            if self.last_confirmations:
+                entry["confirmations"] = list(self.last_confirmations)
+            declined = [c for c in self.last_confirmations if c["answer"] != "y"]
+            err = cli_error(output)
+            if declined:
+                entry.update(ok=False, error=(
+                    f"interactive confirmation declined ('{declined[0]['prompt']}') — "
+                    "command NOT applied; re-run with auto_confirm=true"))
+            elif err:
+                entry.update(ok=False, error=f"CLI error: {err}")
+            results.append(entry)
+            if not entry["ok"] and stop_on_error:
+                abort_reason = f"stop_on_error after '{command}'"
         return results
 
     async def close(self) -> bool:

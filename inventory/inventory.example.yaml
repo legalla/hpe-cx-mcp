@@ -1,174 +1,168 @@
-# ============================================================
-#  ArubaOS-CX Inventory — arubacx-mcp  (EXAMPLE / TEMPLATE)
-# ============================================================
+# =============================================================================
+#  cx-mcp — Switch inventory (TEMPLATE)
+# =============================================================================
+#  cp inventory/inventory.example.yaml inventory/inventory.yaml
+#  (inventory.yaml is git-ignored: it holds real IPs.)
 #
-# Copy this file to inventory/inventory.yaml and adapt it to your fleet:
-#   cp inventory/inventory.example.yaml inventory/inventory.yaml
+#  The file has 3 steps. Only steps 1 and 2 are required.
 #
-# inventory/inventory.yaml is git-ignored (it holds real IPs & credentials).
-# All IP addresses below use RFC 5737 documentation ranges (192.0.2.0/24,
-# 198.51.100.0/24, 203.0.113.0/24) — replace them with your own.
+#    STEP 1  source     WHERE the switch list comes from      (required)
+#    STEP 2  defaults   HOW to connect to every switch        (required)
+#    STEP 3  devices    The switch list itself                (only if source = local)
 #
-# Credentials can also be defined via environment variables:
-#   ARUBA_DEFAULT_USERNAME=admin
-#   ARUBA_DEFAULT_PASSWORD=mypassword
-#   ARUBA_API_VERSION=v10.09
+#    Optional: sources (NetBox/Nautobot/Infrahub connection), vault, sites
 #
-# Values in this file override environment variables.
-# ============================================================
-#
-# ── Inventory sources & priority (selection) ────────────────
-# This selects WHERE the device list comes from. It is a general inventory
-# notion, valid even when staying fully local (local is NOT "dynamic").
-#
-source: local                   # single source (default if omitted)
-#   source: netbox                 # single external source
-#   source: [local, netbox]        # several sources merged together
-#
-# When several sources are used, a device present in more than one source is
-# taken from the HIGHER-priority source. Priority follows the order of the
-# `source` list, or an explicit `source_priority` (highest first):
-#
-#   source: [local, netbox]
-#   source_priority: [local, netbox]   # local wins over netbox
-#
-# ── Dynamic inventory (external sources of truth) ───────────
-# Only relevant when a source other than `local` is selected above. Pull the
-# device list from an external source of truth: netbox, nautobot or infrahub.
-#
-# Each external source needs a URL + token. Provide them either statically here
-# under `sources:`, or via environment variables:
-#   NetBox   : NETBOX_URL   / NETBOX_TOKEN
-#   Nautobot : NAUTOBOT_URL / NAUTOBOT_TOKEN
-#   Infrahub : INFRAHUB_URL / INFRAHUB_TOKEN   (GraphQL API)
-# Generic per-named-source: <NAME>_URL / <NAME>_TOKEN
-#
-# NEVER hardcode a real token in this file — prefer the environment variables
-# above (see .env.example) so secrets stay out of git.
-#
-# sources:
-#   netbox:
-#     type: netbox                 # netbox | nautobot | infrahub
-#     url: https://netbox.example.com
-#     token: "<api-token>"         # or via NETBOX_TOKEN
-#     verify_ssl: false
-#     timeout: 15
-#   nautobot:
-#     type: nautobot
-#     url: https://nautobot.example.com
-#     # token via NAUTOBOT_TOKEN
-#   infrahub:
-#     type: infrahub
-#     url: https://infrahub.example.com
-#     # token via INFRAHUB_TOKEN
-#     branch: main                 # Infrahub branch to query
-#     device_kind: DcimDevice      # node kind holding the devices
-#     # Related nodes surfaced under `extra`. "location:shortname" reads the
-#     # location's shortname (this schema identifies locations by shortname).
-#     metadata_relationships: ["location:shortname", "zone"]
-#     # Search criterion -> GraphQL filter for this schema.
-#     filter_map:
-#       device_group: device_groups__name__value
-#       location: location__shortname__value
-#       site: location__shortname__value
-#       rack: location__shortname__value
-#       zone: zone__name__value
-#
-# When searching devices (find_devices tool), native filters are: name (the
-# device), site, tenant, location, rack, zone, device_group, tag. For Infrahub
-# `device_group` filters on group membership and location/site/rack/zone on the
-# location relationships. Any other attribute is resolved as a NetBox/Nautobot
-# CUSTOM FIELD (and matched against tags for the local source).
-#
-# ── Credentials & HashiCorp Vault (optional) ────────────────
-# Credentials priority (highest first):
-#   1) device-specific credentials (set on the device entry below)
-#   2) HashiCorp Vault (if `vault` is enabled globally or per device)
-#   3) environment variables / defaults
-#
-# Enable Vault globally with a shorthand or a detailed block. URL/token come
-# from VAULT_ADDR / VAULT_TOKEN env vars (or url/token keys here).
-#
-#   vault: true                    # shorthand: enable for all devices
-#
-#   vault:
-#     enabled: true
-#     # url: https://vault.example.com   # or VAULT_ADDR
-#     # token: "<vault-token>"           # or VAULT_TOKEN
-#     mount: secret                 # KV mount (default: secret)
-#     kv_version: 2                 # 1 or 2 (default: 2)
-#     path_template: "{device}"     # secret path, {device} = device name
-#
-# A single device can opt into Vault with `vault: true` on its entry.
-# ============================================================
+#  Changes are picked up without restart:
+#    docker compose exec hpe-cx-mcp python security/cx_reload.py
+# =============================================================================
 
-# ── Default values (overridden per device) ──────────────────
+
+# -----------------------------------------------------------------------------
+# STEP 1 — Where does the switch list come from?
+# -----------------------------------------------------------------------------
+#   source: local                You list the switches yourself (STEP 3).
+#   source: netbox               Taken from NetBox    -> see "sources" below.
+#   source: nautobot             Taken from Nautobot  -> see "sources" below.
+#   source: infrahub             Taken from Infrahub  -> see "sources" below.
+#   source: [local, netbox]      Both merged. If a switch is in both, the FIRST
+#                                source of the list wins.
+#
+#   Note: when "local" is NOT in the list, the "devices:" block is ignored.
+# -----------------------------------------------------------------------------
+source: local
+
+
+# -----------------------------------------------------------------------------
+# STEP 2 — Connection settings applied to EVERY switch (any source)
+# -----------------------------------------------------------------------------
+#  A switch entry (STEP 3) or a NetBox/Infrahub record can override any of them.
+#  A key left out falls back to the environment variable shown in brackets.
+#
+#  Keep secrets OUT of this file: put the password in .env
+#  (ARUBA_DEFAULT_PASSWORD) or use Vault (see end of file).
+# -----------------------------------------------------------------------------
 defaults:
-  username: admin
-  password: ""              # set via ARUBA_DEFAULT_PASSWORD env var, Vault, or per device
-  api_version: latest       # dynamic detection via https://<switch>/rest, then use latest.version
-  verify_ssl: false
-  timeout: 30
-  access_mode: read-only    # set to read-write to allow configuration changes
-  # site: campus-principal  # optional default site (inherited by devices without 'site')
+  username: admin           # [ARUBA_DEFAULT_USERNAME]
+  # password: ...           # [ARUBA_DEFAULT_PASSWORD] -> keep it in .env
+  api_version: latest       # [ARUBA_API_VERSION] "latest" = auto-detect per switch.
+                            #   Use it if firmware versions are mixed. Or pin: v10.13
+  verify_ssl: false         # [ARUBA_VERIFY_SSL] false = accept self-signed certs (lab)
+  timeout: 30               # REST timeout in seconds
+  access_mode: read-only    # read-only  = the MCP can only read
+                            # read-write = the MCP may push configuration
 
-# ── Device list ──────────────────────────────────────────────
+  # Rarely needed:
+  # ssh_port: 22            # [ARUBA_SSH_PORT]
+  # ssh_username: ...       # default: same as username
+  # ssh_password: ...       # default: same as password
+  # site: my-site           # site given to switches that have none
+
+
+# -----------------------------------------------------------------------------
+# STEP 3 — Switch list (used ONLY if "local" is in source)
+# -----------------------------------------------------------------------------
+#  Minimal entry : the name, and the IP or DNS name.
+#        Core-01: 192.0.2.10
 #
-# The 'site' concept is OPTIONAL. Two ways to use it:
-#   1) A 'site' field per device (below).
-#   2) A 'sites:' block grouping devices together (see example at the end of the file).
-# Tools accept a 'site' parameter to operate only on devices in that site
-# (for example list_devices(site=...), run_on_site(site, ...)).
+#  Full entry (every key is optional except host):
+#        Core-01:
+#          host: 192.0.2.10              IP or DNS name           (required)
+#          site: campus                  groups switches: tools accept site=...
+#          tags: [core, campus]          free labels, used by find_devices
+#          description: "Core switch"    free text
+#          access_mode: read-write       overrides defaults (see STEP 2)
+#          username / password / api_version / verify_ssl / timeout / ssh_*
+#                                        overrides defaults (see STEP 2)
+#          vault: true                   read this switch's credentials from Vault
+#
+#  IPs below are documentation ranges (RFC 5737): replace them.
+# -----------------------------------------------------------------------------
 devices:
-
-  # Dict format (name = key)
 
   Core-01:
     host: 192.0.2.10
-    platform: aoscx
-    description: "Core switch"
+    site: campus
     tags: [core, campus]
-    site: campus-principal
-    api_version: latest
-    # access_mode: read-write
+    description: "Core switch"
+    access_mode: read-write
 
   Access-01:
     host: 192.0.2.20
+    site: campus
+    tags: [access, campus]
     description: "Access switch - floor 1"
-    tags: [access, leaf, campus]
-    timeout: 15
-    site: campus-principal
-    # access_mode: read-write
 
-  Access-02:
-    host: 192.0.2.21
-    description: "Access switch - floor 2"
-    tags: [access, leaf, campus]
-    site: campus-principal
-    # Per-device credentials override the defaults / env vars:
-    # username: admin
-    # password: "<device-specific-password>"
-
-  Remote-01:
-    host: 198.51.100.10
-    description: "Remote Access 1"
-    tags: [access, leaf, campus, remote]
-    site: site-distant
+  Access-02: 192.0.2.21               # minimal form (no site, no tags)
 
   Leaf-01:
     host: 203.0.113.10
-    description: "DC Leaf 1"
-    tags: [leaf, dc]
     site: dc
+    tags: [leaf, dc]
+    description: "DC Leaf 1"
 
-# ── Alternative format: explicit site grouping (optional) ──────────
+
+# =============================================================================
+#  OPTIONAL BLOCKS — uncomment only what you need
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# sources — Connection to NetBox / Nautobot / Infrahub
+# -----------------------------------------------------------------------------
+#  Only needed when STEP 1 uses netbox, nautobot or infrahub.
+#  Simplest: set the URL/token in .env and add NOTHING here:
+#     NetBox   -> NETBOX_URL   + NETBOX_TOKEN
+#     Nautobot -> NAUTOBOT_URL + NAUTOBOT_TOKEN
+#     Infrahub -> INFRAHUB_URL + INFRAHUB_TOKEN
+#  Add a block below only to change the defaults (TLS, timeout, Infrahub schema).
+#  The block name must match the name used in STEP 1.
+# -----------------------------------------------------------------------------
+# sources:
+#
+#   netbox:
+#     url: https://netbox.example.com     # or NETBOX_URL
+#     verify_ssl: false                   # NetBox uses a self-signed cert
+#     timeout: 15
+#
+#   infrahub:
+#     url: https://infrahub.example.com   # or INFRAHUB_URL
+#     branch: main
+#     device_kind: DcimDevice             # node type that holds the switches
+#     # Extra fields shown on each switch ("rel:attr" reads a given attribute).
+#     metadata_relationships: ["location:shortname", "zone"]
+#     # find_devices criterion -> GraphQL filter of YOUR Infrahub schema.
+#     filter_map:
+#       device_group: device_groups__name__value
+#       location:     location__shortname__value
+#       site:         location__shortname__value
+#       rack:         location__shortname__value
+#       zone:         zone__name__value
+
+# -----------------------------------------------------------------------------
+# vault — Read switch credentials from HashiCorp Vault
+# -----------------------------------------------------------------------------
+#  Credential priority: switch entry  >  Vault  >  defaults  >  .env
+#  VAULT_ADDR + VAULT_TOKEN come from .env. Secret path = "secret/<switch name>",
+#  with keys username / password (/ ssh_username / ssh_password).
+# -----------------------------------------------------------------------------
+# vault: true                 # all switches
+#
+# vault:                      # same, with explicit settings
+#   mount: secret
+#   kv_version: 2
+#   path_template: "{device}"
+
+# -----------------------------------------------------------------------------
+# sites — Other way to write STEP 3: switches grouped by site
+# -----------------------------------------------------------------------------
+#  Same result as setting "site:" on every switch. A site can also override
+#  username / password / api_version / verify_ssl / timeout / ssh_* / access_mode.
+# -----------------------------------------------------------------------------
 # sites:
-#   campus-principal:
-#     # optional overrides shared by the site (username, api_version, timeout...)
+#   campus:
+#     access_mode: read-write
 #     devices:
-#       Core-01:
-#         host: 192.0.2.10
-#   site-distant:
+#       Core-01: 192.0.2.10
+#       Access-01: 192.0.2.20
+#   dc:
 #     devices:
-#       Remote-01:
-#         host: 198.51.100.10
+#       Leaf-01: 203.0.113.10

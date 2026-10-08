@@ -70,6 +70,31 @@ _port = int(os.environ.get("MCP_PORT", "8000"))
 
 mcp = FastMCP("cx-mcp", host=_host, port=_port)
 
+
+def _read_version() -> str:
+    """Image/app version: CX_VERSION env (set by the Dockerfile build arg),
+    else the VERSION file next to server.py, else 'dev'."""
+    env = os.environ.get("CX_VERSION", "").strip()
+    if env:
+        return env
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "VERSION"),
+                  encoding="utf-8") as fh:
+            return fh.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+__version__ = _read_version()
+
+# Runtime health state surfaced by GET /healthz (see server.py).
+_HEALTH: dict = {
+    "started_at": time.time(),
+    "inventory_loaded_at": None,
+    "inventory_error": None,
+    "inventory_reloads": 0,
+}
+
 _inventory_path = os.environ.get("INVENTORY_FILE", "/app/inventory/inventory.yaml")
 _devices: dict[str, DeviceConfig] = {}
 _inventory: Inventory | None = None
@@ -163,7 +188,7 @@ def _bootstrap_dynamic_inventory() -> None:
         # 1) Merge external sources into the local device map (priority-aware).
         if _inv_manager.has_external_sources:
             try:
-                summary = await _inv_manager.prefetch(_devices)
+                summary = await _inv_manager.prefetch(_devices, defaults=_inventory.defaults)
                 if summary["added"] or summary["updated"]:
                     logger.info(
                         "🔄 Dynamic inventory: +%d new, %d updated from %s",
@@ -228,6 +253,7 @@ except Exception as e:
     sys.exit(1)
 else:
     _devices = _inventory.devices
+    _HEALTH["inventory_loaded_at"] = time.time()
     logger.info("✅ %d device(s) loaded: %s", len(_devices), list(_devices.keys()))
     _src_summary = ", ".join(
         f"{s['name']}({s['type']})" for s in
@@ -250,6 +276,27 @@ def _canonical_device(device: str) -> str:
     return matched
 
 
+_VSF_SUFFIX_RE = re.compile(r"^(.*?)[-_ ]?(\d+)$")
+
+
+def _vsf_member_of(name: str) -> str | None:
+    """Conductor of a secondary VSF/VC member listed as its own inventory entry
+    (NetBox virtual-chassis master, else: no management IP of its own and
+    named '<conductor><N>', e.g. Campus-6300-VSF2 -> Campus-6300-VSF)."""
+    dev = _devices.get(name)
+    if dev is None:
+        return None
+    explicit = (dev.extra or {}).get("vsf_member_of")
+    if explicit:
+        return explicit
+    if dev.host and dev.host != name:
+        return None
+    m = _VSF_SUFFIX_RE.match(name)
+    if m and m.group(1) in _devices and _devices[m.group(1)].host != m.group(1):
+        return m.group(1)
+    return None
+
+
 # ── Pool de sessions REST ─────────────────────────────────────────────
 # Sessions are pooled and reused across requests during a workflow (a single
 # login per device), then closed explicitly via the `logout` tool at the end of
@@ -259,6 +306,29 @@ def _canonical_device(device: str) -> str:
 _CLIENT_POOL: dict[str, dict] = {}  # canonical name → {"client": ArubaOSCXClient, "last_used": float}
 _SESSION_IDLE_TTL = float(os.environ.get("CX_SESSION_IDLE_TTL", "600"))  # seconds
 _REAPER_TASKS: set = set()  # keeps a reference to background logout tasks (anti-GC)
+
+# ── Write options propagated from the dispatchers to _domain_write ────
+# Set per call (contextvars follow the task tree, so asyncio.gather fan-out
+# inherits them). `force` lifts the CX_PROTECTED_OBJECTS guard for one apply.
+import contextvars  # noqa: E402
+FORCE_PROTECTED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cx_force_protected", default=False)
+# Firmware auto-checkpoint (confirmed-commit) wrapped around every apply.
+# Global default from CX_AUTO_CHECKPOINT (true); a call may opt out with
+# auto_checkpoint=false (contextvar; None = use the global default).
+_AUTO_CHECKPOINT = _env_bool("CX_AUTO_CHECKPOINT", True)
+_AUTO_CHECKPOINT_MINUTES = max(1, min(60, int(os.environ.get("CX_AUTO_CHECKPOINT_MINUTES", "10"))))
+AUTO_CHECKPOINT_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
+    "cx_auto_checkpoint_override", default=None)
+# Apply results: compact per-item lists by default (summary + failures only);
+# verbose=true on the dispatcher returns the full per-object detail.
+VERBOSE_RESULT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cx_verbose_result", default=False)
+
+
+def auto_checkpoint_enabled() -> bool:
+    override = AUTO_CHECKPOINT_OVERRIDE.get()
+    return _AUTO_CHECKPOINT if override is None else bool(override)
 
 
 def _new_client(name: str) -> ArubaOSCXClient:
@@ -344,6 +414,7 @@ def _get_client(device: str) -> ArubaOSCXClient:
     """
     name = _canonical_device(device)
     _reap_idle_sessions(exclude=name)
+    _ensure_background_reaper()
     entry = _CLIENT_POOL.get(name)
     if entry is None:
         entry = {"client": _new_client(name), "last_used": time.monotonic()}
@@ -354,14 +425,15 @@ def _get_client(device: str) -> ArubaOSCXClient:
 
 def _reap_idle_sessions(exclude: str | None = None) -> None:
     """Close (best-effort) pooled sessions that have been idle for too long.
-    Called lazily on every pool access: no background task required.
-    A recently used session (currently in use) is never closed."""
+    Called lazily on every pool access and by the background reaper.
+    A session currently in use is never closed."""
     if _SESSION_IDLE_TTL <= 0:
         return
     now = time.monotonic()
     stale = [
         n for n, e in list(_CLIENT_POOL.items())
         if n != exclude and (now - e["last_used"]) > _SESSION_IDLE_TTL
+        and getattr(e["client"], "_active", 0) <= 0
     ]
     for n in stale:
         entry = _CLIENT_POOL.pop(n, None)
@@ -378,6 +450,32 @@ async def _safe_logout(client: ArubaOSCXClient) -> bool:
         return False
 
 
+_REAPER_INTERVAL = float(os.environ.get("CX_SESSION_REAPER_INTERVAL", "60"))
+_BG_REAPER: asyncio.Task | None = None
+
+
+def _ensure_background_reaper() -> None:
+    """Start (once per event loop) a task that closes idle REST/SSH sessions
+    even when no other device is accessed — the lazy reaper alone leaves the
+    last-used devices' sessions open on the switch."""
+    global _BG_REAPER
+    if _REAPER_INTERVAL <= 0:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _BG_REAPER is not None and not _BG_REAPER.done() and _BG_REAPER.get_loop() is loop:
+        return
+
+    async def _loop():
+        while True:
+            await asyncio.sleep(_REAPER_INTERVAL)
+            _reap_idle_sessions()
+            _reap_idle_ssh()
+    _BG_REAPER = loop.create_task(_loop())
+
+
 async def _close_sessions(names) -> list[str]:
     """Close the pooled sessions of the given devices. Returns the names that were
     actually closed (session open at call time)."""
@@ -387,10 +485,18 @@ async def _close_sessions(names) -> list[str]:
             canon = _canonical_device(name)
         except ValueError:
             continue
-        entry = _CLIENT_POOL.pop(canon, None)
-        if entry is not None:
-            if await _safe_logout(entry["client"]):
-                closed.append(canon)
+        entry = _CLIENT_POOL.get(canon)
+        if entry is None:
+            continue
+        client = entry["client"]
+        if getattr(client, "_active", 0) > 0:
+            # A parallel operation is mid-request on this session: let its last
+            # user close it instead of pulling the connector from under it.
+            client._close_when_idle = True
+            continue
+        _CLIENT_POOL.pop(canon, None)
+        if await _safe_logout(client):
+            closed.append(canon)
     return closed
 
 
@@ -430,6 +536,7 @@ async def _get_ssh_client(device: str) -> ArubaOSCXSSHClient:
     The session stays open for subsequent requests."""
     name = _canonical_device(device)
     _reap_idle_ssh(exclude=name)
+    _ensure_background_reaper()
     entry = _SSH_POOL.get(name)
     if entry is None or not entry["client"].is_connected:
         dev = _devices[name]
@@ -476,7 +583,9 @@ async def _ssh_exec(device: str, runner):
     try:
         return await runner(client)
     except ArubaSSHError:
-        if not was_pooled:
+        # Only retry when the pooled session really died; a timeout on a
+        # still-synchronised session is a genuine command error (no replay).
+        if not was_pooled or client.is_connected:
             raise
         entry = _SSH_POOL.pop(name, None)
         if entry is not None:
@@ -502,32 +611,80 @@ def _devices_in_site(site: str) -> dict[str, DeviceConfig]:
     return matched
 
 
+def _coerce_device_list(device) -> list:
+    """Normalize a ``device`` argument into a list of identifiers.
+
+    Accepts a real list, a JSON-array-looking string ('["A","B"]' / "['A','B']"),
+    a comma-separated string ("A, B") or a single name. MCP clients sometimes
+    serialize arrays as strings, so every entry point must tolerate all forms."""
+    if device is None:
+        return []
+    if isinstance(device, (list, tuple, set)):
+        return [str(d).strip() for d in device if d is not None and str(d).strip()]
+    if isinstance(device, str):
+        s = device.strip()
+        if not s:
+            return []
+        if s[0] == "[" and s[-1] == "]":
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(d).strip() for d in parsed if str(d).strip()]
+            except Exception:  # noqa: BLE001 — tolerate single quotes / loose fmt
+                pass
+            return [p.strip().strip("'\"") for p in s[1:-1].split(",")
+                    if p.strip().strip("'\"")]
+        if "," in s:
+            return [p.strip() for p in s.split(",") if p.strip()]
+        return [s]
+    return [str(device)]
+
+
 def _resolve_devices(device: str = None, site: str = None) -> list[str]:
     """
-    Resolve the target of a request into a list of device names.
+    Resolve the target of a request into a de-duplicated list of canonical
+    device names.
 
-    - site provided: all devices of the site (filtered by 'device' if it is
-      also provided and present in the site).
-    - site absent: the single 'device' provided.
-
-    The site notion is therefore optional; without it, the historical
-    single-device behavior is preserved.
+    - `device` accepts ONE name/IP, a list, or a comma-separated string
+      ("A,B,C") — every write tool therefore fans out over several devices.
+    - site provided: all devices of the site (restricted to `device` entries
+      when both are given; an entry outside the site raises).
+    - site absent: the `device` entries, resolved to canonical names.
     """
+    wanted = _coerce_device_list(device)
+    out: list[str] = []
+
+    def _add(name: str) -> None:
+        conductor = _vsf_member_of(name)
+        if conductor:
+            raise ValueError(
+                f"Device '{name}' is a VSF/stack member of '{conductor}' (no management "
+                f"plane of its own) — target '{conductor}' instead.")
+        if name not in out:
+            out.append(name)
+
     if site:
         in_site = _devices_in_site(site)
-        if device:
-            # Restrict to the requested device if it is in the site
-            if device in in_site:
-                return [device]
-            matched = next((n for n, d in in_site.items() if d.host == device), None)
+        if not wanted:
+            return [n for n in in_site if not _vsf_member_of(n)]
+        for d in wanted:
+            if d in in_site:
+                _add(d)
+                continue
+            matched = next((n for n, dv in in_site.items() if dv.host == d), None)
             if matched is None:
                 raise ValueError(
-                    f"Device '{device}' does not belong to site '{site}'."
+                    f"Device '{d}' does not belong to site '{site}'."
                 )
-            return [matched]
-        return list(in_site.keys())
-    if device:
-        return [device]
+            _add(matched)
+        return out
+    if wanted:
+        for d in wanted:
+            try:
+                _add(_canonical_device(d))
+            except ValueError:
+                _add(d)  # unknown: let the per-device call surface the error
+        return out
     raise ValueError("You must provide 'device' and/or 'site'.")
 
 
@@ -597,6 +754,9 @@ def list_devices(site: str = None) -> dict:
                 "source": dev.source,
                 "site": dev.site or None,
                 "tags": dev.tags,
+                **({"vsf_member_of": _vsf_member_of(name),
+                    "note": "stack member — not directly manageable, target its conductor"}
+                   if _vsf_member_of(name) else {}),
             }
             for name, dev in selected.items()
         ],
@@ -781,15 +941,19 @@ async def _reload_inventory() -> dict:
     try:
         _inventory = load_inventory(_inventory_path)
     except Exception as exc:  # noqa: BLE001
+        _HEALTH["inventory_error"] = f"{type(exc).__name__}: {exc}"
         return {"status": "error", "error": f"Failed to reload inventory: {exc}"}
 
     _devices = _inventory.devices
     _inv_manager = InventoryManager(_inventory)
+    _HEALTH["inventory_loaded_at"] = time.time()
+    _HEALTH["inventory_error"] = None
+    _HEALTH["inventory_reloads"] += 1
 
     summary = {"added": [], "updated": [], "errors": {}, "sources": []}
     if _inv_manager.has_external_sources:
         try:
-            summary = await _inv_manager.prefetch(_devices)
+            summary = await _inv_manager.prefetch(_devices, defaults=_inventory.defaults)
         except Exception as exc:  # noqa: BLE001
             summary["errors"]["_prefetch"] = str(exc)
 
@@ -819,6 +983,57 @@ async def _reload_inventory() -> dict:
         "vault_resolved": vault_resolved,
         "errors": summary.get("errors", {}),
     }
+
+
+def health_snapshot() -> tuple[int, dict]:
+    """(http_status, body) for GET /healthz — no secrets, no device I/O.
+
+    503 when the server cannot serve: LOCKED (auth on, 0 tokens) or an empty
+    inventory. 200 otherwise, with status 'ok' or 'degraded' (last inventory
+    reload failed, external source errors)."""
+    now = time.time()
+    tokens = len(_token_store) if _token_store is not None else 0
+    locked = _AUTH_ENABLED and tokens == 0
+    problems: list[str] = []
+    if locked:
+        problems.append("locked: CX_AUTH_ENABLED with 0 tokens")
+    if not _devices:
+        problems.append("inventory: 0 devices loaded")
+    if _HEALTH.get("inventory_error"):
+        problems.append(f"inventory reload failed: {_HEALTH['inventory_error']}")
+    fatal = locked or not _devices
+    status = "unavailable" if fatal else ("degraded" if problems else "ok")
+    sites = sorted({d.site for d in _devices.values() if d.site})
+    body = {
+        "status": status,
+        "version": __version__,
+        "uptime_seconds": int(now - _HEALTH["started_at"]),
+        "problems": problems,
+        "inventory": {
+            "devices": len(_devices),
+            "sites": len(sites),
+            "writable_devices": sum(1 for d in _devices.values() if d.can_write),
+            "sources": list(_inventory.source_order) if _inventory else [],
+            "loaded_at": _HEALTH.get("inventory_loaded_at"),
+            "reloads": _HEALTH.get("inventory_reloads", 0),
+            "last_error": _HEALTH.get("inventory_error"),
+        },
+        "auth": {"enabled": _AUTH_ENABLED, "tokens": tokens, "locked": locked},
+        "audit": {"enabled": _AUDIT_ENABLED, "level": _AUDIT_LEVEL,
+                  "stdout": _AUDIT_STDOUT},
+        "write_safety": {
+            "enabled": _env_bool("CX_WRITE_SAFETY", False),
+            "require_dry_run_token": _env_bool("CX_REQUIRE_DRY_RUN_TOKEN", False),
+            "auto_checkpoint": _AUTO_CHECKPOINT,
+            "auto_checkpoint_minutes": _AUTO_CHECKPOINT_MINUTES,
+            "protected_objects": [
+                p.strip() for p in os.environ.get("CX_PROTECTED_OBJECTS", "").split(",")
+                if p.strip()],
+        },
+        "sessions": {"rest": len(_CLIENT_POOL), "ssh": len(_SSH_POOL)},
+        "tools_advertised": len(getattr(getattr(mcp, "_tool_manager", None), "_tools", {}) or {}),
+    }
+    return (503 if fatal else 200), body
 
 
 async def _reload_runtime() -> dict:

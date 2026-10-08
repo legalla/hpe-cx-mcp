@@ -7,8 +7,10 @@ import asyncio
 import base64
 import calendar
 import difflib
+import fnmatch
 import ipaddress
 import logging
+import os
 import random
 import re
 import time
@@ -17,10 +19,34 @@ from typing import Any, Optional
 
 import aiohttp
 
+from core.config import ssl_setting
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_VERSION = "v10.18"
 _API_VERSION_RE = re.compile(r"^v?\d+\.\d+$", re.IGNORECASE)
+# Max simultaneous HTTP connections to ONE switch (all requests of a pooled
+# session); small platforms (6300/6200) reject bursts with "session limit".
+_MAX_CONCURRENT_PER_DEVICE = max(1, int(os.environ.get("CX_MAX_CONCURRENT_PER_DEVICE", "4")))
+
+
+def protected_object_patterns() -> list[str]:
+    """Glob patterns (fnmatch) from ``CX_PROTECTED_OBJECTS``, matched against
+    the URL-decoded REST path of a resource, e.g.
+    ``/system/vrfs/mgmt``, ``*/bgp_neighbors/spine-RR``,
+    ``/system/interfaces/1/1/2[78]``, ``/system/interfaces/lag*``.
+    Read at call time so a hot-reloaded environment is honoured."""
+    raw = os.environ.get("CX_PROTECTED_OBJECTS", "")
+    return [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+
+
+def protected_object_match(path: str) -> Optional[str]:
+    """Return the first protected pattern matching ``path`` (decoded), else None."""
+    decoded = unquote(path)
+    for pat in protected_object_patterns():
+        if fnmatch.fnmatchcase(decoded, pat) or fnmatch.fnmatchcase(decoded.rstrip("/"), pat):
+            return pat
+    return None
 
 
 class ArubaAPIError(Exception):
@@ -181,6 +207,24 @@ def _v_route_target(value: Any, field: str = "route_target") -> str:
     return s
 
 
+def _v_vrf_rd(value: Any, field: str = "rd") -> str:
+    """VRF route-distinguisher: explicit ASN:NN / IPv4:NN only (the VRF schema has
+    no 'auto' — that value exists for per-VLAN EVPN RDs)."""
+    if str(value).strip().lower() == "auto":
+        raise ArubaAPIError(
+            f"Invalid {field} 'auto': a VRF RD must be explicit ('ASN:NN' or "
+            "'IPv4:NN', e.g. '65000:20000'); 'auto' only exists for per-VLAN EVPN "
+            "RDs.", 400)
+    return _v_route_target(value, field)
+
+
+def _v_vrf_route_target(value: Any, field: str = "route_target") -> str:
+    """VRF-level EVPN route-target: 'auto' or ASN:NN / IPv4:NN."""
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    return _v_route_target(value, field)
+
+
 def _v_ospf_area(value: Any, field: str = "area_id") -> str:
     """Validate an OSPF area id: a 32-bit integer (0-4294967295) or a dotted
     IPv4 form (e.g. 0.0.0.0). Returns the value as a string."""
@@ -198,6 +242,53 @@ def _v_ospf_area(value: Any, field: str = "area_id") -> str:
             f"Invalid {field} '{value}'. Expected a number (0-4294967295) or "
             "a dotted form like 0.0.0.0.", 400)
     return s
+
+
+_ESI_RE = re.compile(r"^[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\."
+                     r"[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}$")
+
+# OSPF per-interface `network_type` friendly aliases -> Port.ospf_if_type enum.
+_OSPF_NETWORK_TYPE_MAP = {
+    "point_to_point": "ospf_iftype_pointopoint",
+    "point-to-point": "ospf_iftype_pointopoint",
+    "broadcast": "ospf_iftype_broadcast",
+    "nbma": "ospf_iftype_nbma",
+    "point_to_multipoint": "ospf_iftype_pointomultipoint",
+    "point-to-multipoint": "ospf_iftype_pointomultipoint",
+    "point_to_multipoint_broadcast": "ospf_iftype_pointomultipoint_broadcast",
+    "loopback": "ospf_iftype_loopback",
+    "virtuallink": "ospf_iftype_virtuallink",
+    "none": "ospf_iftype_none",
+}
+_OSPF_BFD_VALUES = ("enable", "disable", "default")
+
+
+def _v_esi(value: Any, field: str = "evpn_multihoming_esi") -> str:
+    """Validate an EVPN Ethernet Segment Identifier: 'type1-auto' or the
+    00XX.XXXX.XXXX.XXXX.XXXX form (5 dot-separated 16-bit hex groups = 10
+    bytes). Returns it lower-cased (unchanged for 'type1-auto')."""
+    s = str(value).strip()
+    if s == "type1-auto":
+        return s
+    if not _ESI_RE.match(s):
+        raise ArubaAPIError(
+            f"Invalid {field} '{value}'. Expected 'type1-auto' or the "
+            "00XX.XXXX.XXXX.XXXX.XXXX form (e.g. 015c.a47d.2510.0000.0100).",
+            400)
+    return s.lower()
+
+
+def _v_lag_name(value: Any, field: str = "lag_id") -> str:
+    """Normalise a LAG identifier: accepts an int, a digit string or 'lagN'.
+    Returns the canonical interface name 'lagN'."""
+    s = str(value).strip().lower()
+    if s.startswith("lag"):
+        s = s[3:]
+    if not s.isdigit():
+        raise ArubaAPIError(
+            f"Invalid {field} '{value}'. Expected an integer (e.g. 1) or a "
+            "name like 'lag1'.", 400)
+    return f"lag{int(s)}"
 
 
 class ArubaOSCXClient:
@@ -229,9 +320,19 @@ class ArubaOSCXClient:
         # Incremented on every successful (re)login. Used to coalesce concurrent
         # 401 recovery so peers don't tear down a freshly re-established session.
         self._session_gen = 0
+        # Number of `async with` users currently holding this pooled client, and
+        # a deferred-close flag: a logout requested while peers are mid-request
+        # waits for the last one instead of closing the connector under them.
+        self._active = 0
+        self._close_when_idle = False
         # Inventory-driven write policy. True = allows POST/PUT/DELETE (except
         # login/logout always allowed). False = read-only mode.
         self._write_enabled = True
+        # When True, updates/deletes on CX_PROTECTED_OBJECTS are allowed (force).
+        self.allow_protected = False
+        # Successful POST/PUT/DELETE counter (lets callers tell 'nothing was
+        # written' apart from 'failed mid-way').
+        self.writes = 0
 
     @staticmethod
     def _normalize_api_version(value: str) -> str:
@@ -294,6 +395,15 @@ class ArubaOSCXClient:
         self._write_enabled = bool(enabled)
 
     def _assert_write_allowed(self, method: str, path: str) -> None:
+        if method in ("PUT", "DELETE") and not self.allow_protected:
+            pat = protected_object_match(path)
+            if pat is not None and path not in ("/configs/autocheckpoint",):
+                raise ArubaAPIError(
+                    f"Write blocked on {self.host}: '{unquote(path)}' matches protected "
+                    f"object pattern '{pat}' (CX_PROTECTED_OBJECTS). Re-run with "
+                    f"force=true to override ({method}).",
+                    403,
+                )
         if self._write_enabled:
             return
         if path in ("/login", "/logout"):
@@ -341,13 +451,22 @@ class ArubaOSCXClient:
         return []
 
     async def __aenter__(self):
-        await self._connect()
+        self._active += 1
+        try:
+            await self._connect()
+        except BaseException:
+            self._active -= 1
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._active -= 1
         # In pooled mode (_auto_logout=False), the session is kept open
         # so it can be reused by the following steps of the workflow.
         if self._auto_logout:
+            await self._disconnect()
+        elif self._close_when_idle and self._active <= 0:
+            self._close_when_idle = False
             await self._disconnect()
 
     @property
@@ -371,7 +490,8 @@ class ArubaOSCXClient:
         async with self._connect_lock:
             if self.is_connected:
                 return
-            connector = aiohttp.TCPConnector(ssl=self.verify_ssl if self.verify_ssl else False)
+            connector = aiohttp.TCPConnector(ssl=ssl_setting(self.verify_ssl),
+                                             limit=_MAX_CONCURRENT_PER_DEVICE)
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=self.timeout,
@@ -413,6 +533,13 @@ class ArubaOSCXClient:
             if stale_gen is not None and self._session_gen != stale_gen:
                 return  # a peer already re-authenticated
             if self._session:
+                # Best-effort logout: a session dropped locally without it stays
+                # open on the switch and eats its REST session quota.
+                if not self._session.closed:
+                    try:
+                        await self._session.post(f"{self._base_url}/logout")
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     await self._session.close()
                 except Exception:
@@ -446,6 +573,11 @@ class ArubaOSCXClient:
             async with self._session.post(url, data={"username": self.username, "password": self.password}) as resp:
                 if resp.status != 200:
                     text = await resp.text()
+                    if "session limit" in text.lower() or "too many" in text.lower():
+                        raise ArubaAPIError(
+                            f"REST session limit reached on {self.host} ({text.strip()}). "
+                            "Close idle sessions first (logout tool, or fewer parallel "
+                            "REST/SSH calls to this device), then retry.", resp.status)
                     raise ArubaAPIError(
                         f"Authentication failed on {self.host} ({self.username}): {text}",
                         resp.status,
@@ -520,7 +652,8 @@ class ArubaOSCXClient:
                     raise ArubaAPIError("Session expired or not authorized", 401)
                 elif resp.status not in (200, 201, 202, 204):
                     text = await resp.text()
-                    raise ArubaAPIError(f"POST {path} error: {text}", resp.status)
+                    raise ArubaAPIError(
+                        f"POST {path} error: {text} | body sent: {body!r}", resp.status)
                 elif resp.status == 204:
                     result = {}
                 else:
@@ -545,6 +678,7 @@ class ArubaOSCXClient:
         if expired:
             await self._reconnect(gen)
             return await self._post(path, body, params, _retried=True)
+        self.writes += 1
         return result
 
     async def _put(self, path: str, body: dict | None = None, params: dict | None = None, _retried: bool = False) -> Any:
@@ -562,7 +696,8 @@ class ArubaOSCXClient:
                     raise ArubaAPIError("Session expired or not authorized", 401)
                 elif resp.status not in (200, 201, 202, 204):
                     text = await resp.text()
-                    raise ArubaAPIError(f"PUT {path} error: {text}", resp.status)
+                    raise ArubaAPIError(
+                        f"PUT {path} error: {text} | body sent: {body!r}", resp.status)
                 elif resp.status == 204:
                     result = {}
                 else:
@@ -587,6 +722,7 @@ class ArubaOSCXClient:
         if expired:
             await self._reconnect(gen)
             return await self._put(path, body, params, _retried=True)
+        self.writes += 1
         return result
 
     async def _delete(self, path: str, _retried: bool = False) -> Any:
@@ -629,6 +765,7 @@ class ArubaOSCXClient:
         if expired:
             await self._reconnect(gen)
             return await self._delete(path, _retried=True)
+        self.writes += 1
         return result
 
     # ─── System ──────────────────────────────────────────────────────────────
@@ -1442,15 +1579,26 @@ class ArubaOSCXClient:
             "count": len(matched),
         }
 
-    async def get_routed_ports(self) -> dict:
+    async def get_routed_ports(self, include_unconfigured: bool = False) -> dict:
         """Routed (L3) ports: physical/LAG/sub-interfaces with `routing` enabled
-        (excludes switched L2 ports, VLAN SVIs, loopbacks and overlay types)."""
+        AND an IP address or a non-default VRF (excludes switched L2 ports, VLAN
+        SVIs, loopbacks and overlay types). Platforms like the 8360 default every
+        port to routing, so without the L3-config filter all ports would be listed;
+        `include_unconfigured=True` restores that raw view."""
         excluded = {"vlan", "loopback", "vxlan", "internal", "mgmt", "management"}
+
+        def has_l3_config(raw: dict) -> bool:
+            if raw.get("ip4_address") or raw.get("ip6_address") or raw.get("ip6_addresses"):
+                return True
+            vrf = raw.get("vrf")
+            return bool(vrf) and self._ref_name(vrf) not in (None, "", "default")
 
         def is_routed(name: str, raw: dict) -> bool:
             if raw.get("routing") is not True:
                 return False
-            return str(raw.get("type") or "").lower() not in excluded
+            if str(raw.get("type") or "").lower() in excluded:
+                return False
+            return include_unconfigured or has_l3_config(raw)
 
         matched = await self._filtered_interfaces(is_routed)
         return {
@@ -1573,19 +1721,44 @@ class ArubaOSCXClient:
             "self_loop": lldp_data.get("selfseen", False),
         }
 
-    async def get_lldp_neighbors(self) -> dict:
+    async def get_lldp_neighbors(self, interface: Optional[str] = None) -> dict:
+        """LLDP neighbours (`show lldp neighbor-info`). One wildcard GET
+        (`/system/interfaces/*/lldp_neighbors`) returns every interface's
+        neighbours at once; falls back to one GET per interface on firmware
+        that rejects the wildcard. `interface` filters the local port."""
         neighbors = []
-        data = await self._get("/system/interfaces", params={"depth": "1"})
-        for iface_name, _ in self._collection_items(data):
-            encoded = quote(str(iface_name), safe="")
+        per_iface: dict[str, Any] | None = None
+        if interface is None:
             try:
-                lldp = await self._get(f"/system/interfaces/{encoded}/lldp_neighbors", params={"depth": "2"})
-            except ArubaAPIError:
-                continue
+                data = await self._get("/system/interfaces/*/lldp_neighbors",
+                                       params={"depth": "2"})
+                if isinstance(data, dict):
+                    per_iface = data
+            except ArubaAPIError as exc:
+                if exc.status_code not in (400, 404, 501):
+                    raise
+        if per_iface is None:
+            per_iface = {}
+            if interface is not None:
+                iface_names = [interface]
+            else:
+                data = await self._get("/system/interfaces", params={"depth": "1"})
+                iface_names = [str(n) for n, _ in self._collection_items(data)]
+            for iface_name in iface_names:
+                encoded = quote(iface_name, safe="")
+                try:
+                    per_iface[iface_name] = await self._get(
+                        f"/system/interfaces/{encoded}/lldp_neighbors",
+                        params={"depth": "2"})
+                except ArubaAPIError:
+                    continue
+        for iface_name, lldp in per_iface.items():
             for _, lldp_data in self._collection_items(lldp):
                 if not isinstance(lldp_data, dict):
                     continue
                 neighbors.append(self._format_lldp_neighbor(str(iface_name), lldp_data))
+        neighbors.sort(key=lambda n: [(0, int(p)) if p.isdigit() else (1, p)
+                                      for p in re.split(r"[/:]", str(n["local_interface"]))])
         return {"lldp_neighbors": neighbors, "count": len(neighbors)}
 
     # ─── Routing ─────────────────────────────────────────────────────────────
@@ -3061,7 +3234,7 @@ class ArubaOSCXClient:
                 rd.rsplit(":", 1)[0] if isinstance(rd, str) and ":" in rd else None
             )
             # ES peer members are references to Tunnel_Endpoint resources whose key
-            # encodes the *peer* VTEP IP, e.g. "vxlan1,default,evpn,10.147.253.173".
+            # encodes the *peer* VTEP IP, e.g. "vxlan1,default,evpn,192.0.2.173".
             members_raw = es.get("es_members")
             member_keys: list[str] = []
             if isinstance(members_raw, dict):
@@ -3277,6 +3450,66 @@ class ArubaOSCXClient:
             "synced_features": sorted(features),
             "synced_feature_count": len(features),
         }
+
+    async def configure_vsx(self, *, role: Optional[str] = None,
+                            isl_interface: Optional[str] = None,
+                            keepalive_interface: Optional[str] = None,
+                            keepalive_vrf: Optional[str] = None,
+                            keepalive_src_ip: Optional[str] = None,
+                            keepalive_peer_ip: Optional[str] = None,
+                            system_mac: Optional[str] = None,
+                            config_sync_disable: Optional[bool] = None,
+                            linkup_delay_timer: Optional[int] = None,
+                            extra: Optional[dict] = None) -> dict:
+        """Create/update the VSX pairing configuration on THIS device (idempotent,
+        read-modify-write). VSX is inherently a pair: the caller is responsible
+        for applying the mirrored/symmetric configuration (role inverted,
+        keepalive src/peer IPs swapped) on the peer device."""
+        if system_mac is not None:
+            system_mac = _v_mac(system_mac, "system_mac")
+        if keepalive_src_ip is not None:
+            keepalive_src_ip = _v_ip_host(keepalive_src_ip, "keepalive_src_ip")
+        if keepalive_peer_ip is not None:
+            keepalive_peer_ip = _v_ip_host(keepalive_peer_ip, "keepalive_peer_ip")
+        body: dict[str, Any] = {}
+        if role is not None:
+            body["device_role"] = role
+        if isl_interface is not None:
+            body["isl_port"] = self._uri(
+                f"/system/interfaces/{quote(isl_interface, safe='')}")
+        if keepalive_interface is not None:
+            body["keepalive_port"] = self._uri(
+                f"/system/interfaces/{quote(keepalive_interface, safe='')}")
+        if keepalive_vrf is not None:
+            body["keepalive_vrf"] = self._uri(
+                f"/system/vrfs/{quote(keepalive_vrf, safe='')}")
+        if keepalive_src_ip is not None:
+            body["keepalive_src_ip"] = keepalive_src_ip
+        if keepalive_peer_ip is not None:
+            body["keepalive_peer_ip"] = keepalive_peer_ip
+        if system_mac is not None:
+            body["system_mac"] = system_mac
+        if config_sync_disable is not None:
+            body["config_sync_disable"] = bool(config_sync_disable)
+        if linkup_delay_timer is not None:
+            body["linkup_delay_timer"] = _v_int_range(
+                linkup_delay_timer, 0, 600, "linkup_delay_timer")
+        if extra:
+            body.update({k: v for k, v in extra.items() if v is not None})
+        if not body:
+            return {"status": "noop", "reason": "no field provided"}
+        await self._put_merge("/system/vsx", body)
+        return {"status": "updated", "config": body}
+
+    async def delete_vsx(self) -> dict:
+        """Remove the VSX configuration on this device (idempotent)."""
+        try:
+            await self._delete("/system/vsx")
+            return {"deleted": True, "status": "deleted"}
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return {"deleted": False, "status": "absent"}
+            raise
 
     # ─── Maintenance Mode ────────────────────────────────────────────────────
 
@@ -4227,14 +4460,15 @@ class ArubaOSCXClient:
     # ─── Configs / Checkpoints ───────────────────────────────────────────────
 
     async def _get_text(self, path: str, params: dict | None = None, _retried: bool = False) -> str:
-        """GET that returns the raw body (text) without JSON parsing."""
+        """GET that returns the raw body (text) without JSON parsing.
+        Sends `Accept: text/plain`: /configs/* otherwise answers in REST JSON."""
         url = f"{self._base_url}{path}"
         await self._ensure_live()
         gen = self._session_gen
         expired = False
         result = ""
         try:
-            async with self._session.get(url, params=params, headers={"Content-Type": "application/json"}) as resp:
+            async with self._session.get(url, params=params, headers={"Accept": "text/plain"}) as resp:
                 if resp.status == 401 and not _retried:
                     expired = True  # re-login + retry once, after releasing the response
                 elif resp.status == 401:
@@ -4450,7 +4684,8 @@ class ArubaOSCXClient:
         if mode:
             params["mode"] = mode
         content = await self._get_text(f"/configs/{name}", params=params or None)
-        result: dict = {"name": name, "format": "cli-text", "content": content}
+        fmt = "json" if content.lstrip().startswith(("{", "[")) else "cli-text"
+        result: dict = {"name": name, "format": fmt, "content": content}
         if diff:
             result["diff_with"] = diff
             result["diff_mode"] = mode or "default"
@@ -5612,6 +5847,34 @@ class ArubaOSCXClient:
                 return None
             raise
 
+    async def _put_merge(self, path: str, patch: dict, *, depth: int = 1) -> dict:
+        """Read-modify-write update: GET the writable object, deep-merge `patch`
+        into it and PUT the FULL object back. This is the only safe way to
+        update an existing AOS-CX resource — a sparse PUT resets every omitted
+        writable attribute to its default. Raises ArubaAPIError(404) when the
+        resource does not exist (caller should POST-create instead)."""
+        existing = await self._read_writable(path, depth=depth)
+        if existing is None:
+            raise ArubaAPIError(f"Resource not found: {path}", 404)
+        self._deep_merge(existing, patch)
+        await self._put(path, existing)
+        return existing
+
+    async def _clear_lacp_aggregation_key(self, member_names: list[str]) -> None:
+        """Strip `other_config.lacp-aggregation-key` from former LAG member
+        ports — mirrors what `no interface lag N` does natively in CLI. A LAG
+        delete/member-removal via REST only detaches the port from the LAG's
+        `interfaces` map; unlike the CLI it leaves this key stamped on the
+        member, which blocks the port from re-joining another LAG or working
+        standalone until cleared."""
+        for member in member_names:
+            member_path = f"/system/interfaces/{quote(member, safe='')}"
+            existing = await self._read_writable(member_path)
+            if not existing or "lacp-aggregation-key" not in (existing.get("other_config") or {}):
+                continue
+            existing["other_config"].pop("lacp-aggregation-key", None)
+            await self._put(member_path, existing)
+
     async def vlan_exists(self, vlan_id: int) -> bool:
         try:
             await self._get(f"/system/vlans/{vlan_id}", params={"depth": "1"})
@@ -5803,10 +6066,11 @@ class ArubaOSCXClient:
         key = f"vxlan_vni,{vni}"
         if isinstance(existing, dict) and key in existing:
             return {"vni": vni, "vlan": vlan_id, "created": False, "status": "already_exists"}
+        # No `routing` key: false is the default for an L2VNI, and the 10.16
+        # schema rejects it ("values in post body not configurable").
         body = {
             "id": vni,
             "type": "vxlan_vni",
-            "routing": False,
             "interface": {vxlan_interface: self._uri(f"/system/interfaces/{vxlan_interface}")},
             "vlan": {str(vlan_id): self._uri(f"/system/vlans/{vlan_id}")},
         }
@@ -5821,8 +6085,9 @@ class ArubaOSCXClient:
         a plain string causes a 500 error on the firmware side.
         """
         vlan_id = _v_vlan(vlan_id, "vlan_id")
-        import_rts = [_v_route_target(r, "import_rt") for r in import_rts]
-        export_rts = [_v_route_target(r, "export_rt") for r in export_rts]
+        # 'auto' is a valid RT/RD value (RFC 8365 derivation via route_target_auto_mode).
+        import_rts = [r if r == "auto" else _v_route_target(r, "import_rt") for r in import_rts]
+        export_rts = [r if r == "auto" else _v_route_target(r, "export_rt") for r in export_rts]
         if rd not in (None, "auto"):
             rd = _v_route_target(rd, "rd")
         # Creation (POST collection) expects `vlan` as a URI reference.
@@ -5845,7 +6110,7 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put(f"/system/evpn/evpn_vlans/{vlan_id}", update_body)
+            await self._put_merge(f"/system/evpn/evpn_vlans/{vlan_id}", update_body)
             action = "updated"
         else:
             await self._post("/system/evpn/evpn_vlans", create_body)
@@ -5893,7 +6158,8 @@ class ArubaOSCXClient:
             if active_gateway_mac:
                 body["vsx_virtual_gw_mac_v4"] = active_gateway_mac
         if exists:
-            await self._put(f"/system/interfaces/{name}", body)
+            await self._put_merge(f"/system/interfaces/{name}",
+                                  {k: v for k, v in body.items() if k != "name"})
             action = "updated"
         else:
             await self._post("/system/interfaces", body)
@@ -5917,7 +6183,7 @@ class ArubaOSCXClient:
         # If no VLAN mode is set, switch the interface to native-untagged trunk.
         if not current.get("vlan_mode"):
             body["vlan_mode"] = "native-untagged"
-        await self._put(f"/system/interfaces/{encoded}", body)
+        await self._put_merge(f"/system/interfaces/{encoded}", body)
         return {"interface": interface, "vlan": vlan_id, "status": "tagged"}
 
     async def get_uplink_interfaces(self, neighbor_system_names: Optional[set] = None,
@@ -6024,6 +6290,21 @@ class ArubaOSCXClient:
                 return {"vni": vni, "deleted": False, "status": "absent"}
             raise
 
+    async def l2vnis_for_vlan(self, vlan_id: int) -> list[int]:
+        """VNI ids mapped to `vlan_id` (empty when none)."""
+        try:
+            data = await self._get("/system/virtual_network_ids",
+                                   params={"depth": "2", "selector": "configuration"})
+        except ArubaAPIError:
+            return []
+        out = []
+        for _, v in self._collection_items(data or {}):
+            vlan_ref = v.get("vlan") if isinstance(v, dict) else None
+            if isinstance(vlan_ref, dict) and str(vlan_id) in vlan_ref \
+                    and v.get("id") is not None:
+                out.append(int(v["id"]))
+        return out
+
     async def delete_vlan(self, vlan_id: int) -> dict:
         """Delete the VLAN if present."""
         try:
@@ -6050,7 +6331,7 @@ class ArubaOSCXClient:
         if str(vlan_id) not in trunks:
             return {"interface": interface, "vlan": vlan_id, "status": "not_tagged"}
         trunks.pop(str(vlan_id))
-        await self._put(f"/system/interfaces/{encoded}", {"vlan_trunks": trunks})
+        await self._put_merge(f"/system/interfaces/{encoded}", {"vlan_trunks": trunks})
         return {"interface": interface, "vlan": vlan_id, "status": "untagged"}
 
     # ══════════════════════════════════════════════════════════════════════
@@ -6097,8 +6378,8 @@ class ArubaOSCXClient:
         if vrf and vrf != "default":
             body["vrf"] = {vrf: self._uri(f"/system/vrfs/{quote(vrf, safe='')}")}
         if await self.interface_exists(name):
-            await self._put(f"/system/interfaces/{encoded}",
-                            {k: v for k, v in body.items() if k != "name"})
+            await self._put_merge(f"/system/interfaces/{encoded}",
+                                  {k: v for k, v in body.items() if k != "name"})
             return {"interface": name, "ip4_address": ip_cidr, "vrf": vrf,
                     "status": "updated"}
         await self._post("/system/interfaces", body)
@@ -6113,6 +6394,12 @@ class ArubaOSCXClient:
                                          mtu: Optional[int] = None,
                                          vrf: str = "default",
                                          enable: bool = True,
+                                         ensure_internal_vlan_range: bool = False,
+                                         internal_vlan_range_size: int = 128,
+                                         verify_connected_route: bool = True,
+                                         remove_from_lag: bool = False,
+                                         delete_empty_lag: bool = False,
+                                         force_admin_flap: bool = False,
                                          extra: Optional[dict] = None) -> dict:
         """Turn a physical port into a routed (L3) interface (idempotent).
         Used for point-to-point underlay links (no switchport, /31 or /30 IP).
@@ -6121,11 +6408,45 @@ class ArubaOSCXClient:
         changes merged into it, so sibling attributes are never wiped. `enable`
         drives `user_config.admin`; `mtu` is applied to BOTH `ip_mtu` (L3) and
         `user_config.mtu` (physical) so the effective MTU actually changes;
-        omitting `ip_cidr` keeps the existing IP instead of clearing it."""
+        omitting `ip_cidr` keeps the existing IP instead of clearing it.
+
+        `internal-vlan-range` trap: some platforms need a non-empty
+        `system internal-vlan-range` pool to actually route on a physical port
+        (an empty pool, e.g. size 0, silently accepts `routing=true`+IP with NO
+        connected route/line-protocol). When `ip_cidr` is set, the pool is
+        checked first: if it's empty and `ensure_internal_vlan_range=True`, a
+        pool of `internal_vlan_range_size` is configured; otherwise the call
+        FAILS EXPLICITLY (no write performed) with an actionable message
+        instead of silently producing a non-routing port.
+
+        `verify_connected_route` (default True, only when `ip_cidr` is given):
+        after applying, re-reads the VRF route table and confirms the
+        connected route for this prefix is actually installed; if not, the
+        result is marked `status='partial'` with a `warning` instead of a
+        bare success — the caller should not assume the link is passing
+        traffic just because the write itself succeeded.
+
+        `remove_from_lag=True`: if the port is currently bundled into a LAG,
+        remove it from that LAG FIRST (in this same call) instead of failing
+        or requiring a separate 'no lag' step — the result's
+        `removed_from_lag` field names the LAG it was pulled from (None if it
+        wasn't a member of one), with a warning that this bounces the LAG's
+        remaining bundle."""
         if ip_cidr is not None:
             ip_cidr = _v_ipv4_cidr(ip_cidr, "ip_cidr")
         if mtu is not None:
             mtu = _v_mtu(mtu, "mtu")
+        removed_from_lag = None
+        lag_deleted = False
+        if remove_from_lag:
+            lag_result = await self.remove_member_from_lag(
+                name, delete_if_empty=delete_empty_lag)
+            if lag_result["status"] == "removed":
+                removed_from_lag = lag_result["lag"]
+                lag_deleted = lag_result.get("lag_deleted", False)
+        if ip_cidr is not None:
+            await self._guard_internal_vlan_range(
+                ensure_internal_vlan_range, internal_vlan_range_size)
         encoded = quote(name, safe="")
         path = f"/system/interfaces/{encoded}"
         body = await self._read_writable(path) or {}
@@ -6156,8 +6477,542 @@ class ArubaOSCXClient:
                     body[l2_key] = {}
         self._deep_merge(body, changes)
         await self._put(path, body)
-        return {"interface": name, "ip4_address": body.get("ip4_address"),
-                "vrf": vrf, "status": "configured"}
+        # Some firmware has been observed to not reliably apply an admin-state
+        # flip when bundled with a routing/vrf/vlan-mode transition in the same
+        # PUT (the port stays admin down / OSPF never comes up until a manual
+        # 'no shutdown'). Issue a DEDICATED follow-up write for admin state
+        # only (mirrors the CLI treating it as its own config line) and read
+        # back to confirm it actually stuck.
+        admin_target = "up" if enable else "down"
+        try:
+            await self._put_merge(path, {"user_config": {"admin": admin_target}})
+        except ArubaAPIError:
+            pass
+        readback = await self._get_config(path) or {}
+        applied_admin = (readback.get("user_config") or {}).get("admin")
+        flapped = False
+        was_lag_member = bool(removed_from_lag) or force_admin_flap
+        if applied_admin == admin_target:
+            # An ex-LAG member keeps the LAG's enablement-layer state (8360:
+            # pspo_enablement_layer_down) until a real shutdown/no shutdown.
+            oper_ok, flapped = await self._ensure_operational_admin(
+                path, admin_target, force_flap=was_lag_member and enable)
+            if not oper_ok:
+                applied_admin = "down" if admin_target == "up" else "up"
+        result = {"interface": name, "ip4_address": body.get("ip4_address"),
+                  "vrf": vrf, "admin": applied_admin, "status": "configured",
+                  "removed_from_lag": removed_from_lag}
+        if removed_from_lag:
+            result["lag_deleted"] = lag_deleted
+        if flapped:
+            result["admin_flapped"] = True
+        if was_lag_member and enable:
+            l1_reason = await self._l1_down_reason(path)
+            if l1_reason:
+                result["l1_state_down_reason"] = l1_reason
+            if l1_reason and any(t in l1_reason.lower() for t in ("enablement", "admin")):
+                result["status"] = "partial"
+                result["warning"] = (
+                    f"port still not ready after leaving its LAG "
+                    f"(l1_state_down_reason={l1_reason})."
+                    + ("" if lag_deleted else
+                       " If the LAG still exists, re-run with delete_empty_lags=true "
+                       "(CLI equivalent: 'no interface lag N' then shutdown/no shutdown)."))
+        if removed_from_lag:
+            existing_warning = result.get("warning")
+            lag_warning = (
+                f"removed from LAG '{removed_from_lag}' before converting to "
+                "routed — the remaining bundle (if any) was bounced by this "
+                "membership change.")
+            result["warning"] = (f"{lag_warning} {existing_warning}"
+                                 if existing_warning else lag_warning)
+        if applied_admin != admin_target:
+            result["status"] = "partial"
+            existing_warning = result.get("warning")
+            admin_warning = (
+                f"admin state did not apply as '{admin_target}' (device "
+                f"reports '{applied_admin}'). The port may need a manual "
+                "'no shutdown'/link-flap, or is still bound to a LAG that "
+                "controls its member admin state — remove it from any LAG "
+                "before converting to routed.")
+            result["warning"] = (f"{existing_warning} {admin_warning}"
+                                 if existing_warning else admin_warning)
+        if ip_cidr is not None and verify_connected_route:
+            route_ok = await self._connected_route_present(ip_cidr, vrf)
+            if not route_ok:
+                result["status"] = "partial"
+                existing_warning = result.get("warning")
+                route_warning = (
+                    f"no connected route for '{ip_cidr}' found in vrf "
+                    f"'{vrf}' after applying — check line-protocol/L1 state, "
+                    "the 'system internal-vlan-range' pool (see "
+                    "ensure_internal_vlan_range), and that the port isn't "
+                    "still a LAG member.")
+                result["warning"] = (f"{existing_warning} {route_warning}"
+                                     if existing_warning else route_warning)
+            result["connected_route_verified"] = route_ok
+        return result
+
+    async def _ensure_operational_admin(self, path: str, target: str, *,
+                                        force_flap: bool = False) -> tuple[bool, bool]:
+        """Make the OPERATIONAL `admin_state` follow `user_config.admin`.
+        Rewriting the same config value is a no-op for the daemon, so a port
+        left administratively down after a LAG/routing transition (config 'up',
+        admin_state 'down') needs a real down->up flap — what the CLI
+        `shutdown` / `no shutdown` pair does. `force_flap` flaps even when the
+        reported state already matches. Returns (ok, flapped); ok is True
+        when the state is unknown (nothing to enforce)."""
+        async def _oper():
+            try:
+                data = await self._get(path, params={"depth": "1"})
+            except ArubaAPIError:
+                return None
+            state = data.get("admin_state") if isinstance(data, dict) else None
+            return state if state in ("up", "down") else None
+
+        await asyncio.sleep(0.5)
+        state = await _oper()
+        if not force_flap and (state is None or state == target):
+            return True, False
+        opposite = "down" if target == "up" else "up"
+        try:
+            await self._put_merge(path, {"user_config": {"admin": opposite}})
+            await asyncio.sleep(1)
+            await self._put_merge(path, {"user_config": {"admin": target}})
+        except ArubaAPIError:
+            return False, True
+        await asyncio.sleep(1)
+        state = await _oper()
+        return (state is None or state == target), True
+
+    async def _l1_down_reason(self, path: str) -> Optional[str]:
+        """`l1_state_down_reason` when the port's L1 is NOT ready, else None."""
+        try:
+            data = await self._get(path, params={"depth": "1",
+                                                 "attributes": "l1_state,admin_state"})
+        except ArubaAPIError:
+            return None
+        l1 = (data or {}).get("l1_state") if isinstance(data, dict) else None
+        if not isinstance(l1, dict) or l1.get("ready") is not False:
+            return None
+        return l1.get("l1_state_down_reason") or "unknown"
+
+    async def _guard_internal_vlan_range(self, ensure: bool, size: int) -> None:
+        """Pre-flight for the `internal-vlan-range` trap: some platforms won't
+        actually route on a physical port unless a non-empty internal VLAN
+        pool exists. Raises ArubaAPIError (no write performed) unless the
+        caller opted into auto-remediation via `ensure=True`.
+
+        Some firmware/API-version combinations don't expose
+        `internal_vlan_range_base`/`internal_vlan_range_size` as selectable
+        attributes at all (the attributes-filtered GET fails outright with
+        "attribute: ..., not found for resource: System" instead of just
+        returning it empty) — that means the concept doesn't apply to this
+        platform's schema, so fall back to an unfiltered read and, if the
+        fields are still absent there, skip the guard entirely rather than
+        blocking every routed-port conversion on an unsupported precondition."""
+        try:
+            current = await self._get(
+                "/system", params={"depth": "1",
+                                   "attributes": "internal_vlan_range_base,"
+                                                 "internal_vlan_range_size"})
+        except ArubaAPIError:
+            current = await self._get("/system", params={"depth": "1"})
+            if current is None or "internal_vlan_range_size" not in current:
+                return  # not part of this platform's schema -> nothing to guard
+        base = (current or {}).get("internal_vlan_range_base")
+        size_now = (current or {}).get("internal_vlan_range_size")
+        if size_now:
+            return
+        if not ensure:
+            raise ArubaAPIError(
+                "This platform's 'system internal-vlan-range' pool is empty "
+                "(size 0) — activating routing on a physical port would "
+                "silently succeed with NO connected route / line-protocol "
+                "down. Configure a pool first (e.g. 'system "
+                "internal-vlan-range start 1024 end 1151 confirm') or retry this "
+                "call with ensure_internal_vlan_range=True to have it configured "
+                f"automatically (default size {size or 128}).", 400)
+        size = _v_int_range(size, 1, 1280, "internal_vlan_range_size")
+        new_base = base or 1024
+        await self._put_merge("/system", {
+            "internal_vlan_range_base": int(new_base),
+            "internal_vlan_range_size": int(size)})
+        after = await self._get("/system", params={
+            "depth": "1",
+            "attributes": "internal_vlan_range_base,internal_vlan_range_size"})
+        if not (after or {}).get("internal_vlan_range_size"):
+            raise ArubaAPIError(
+                "internal-vlan-range pool is still empty after the REST write; "
+                f"configure it by CLI: 'system internal-vlan-range start {int(new_base)} "
+                f"end {int(new_base) + int(size) - 1} confirm'.", 500)
+
+    async def _connected_route_present(self, ip_cidr: str, vrf: str) -> bool:
+        """Best-effort check that a connected route for `ip_cidr` shows up in
+        the VRF route table (post-check for the internal-vlan-range trap)."""
+        try:
+            network = str(ipaddress.IPv4Interface(ip_cidr).network)
+        except ValueError:
+            return True  # not our job to re-validate the CIDR here
+        try:
+            data = await self._get(f"/system/vrfs/{quote(vrf, safe='')}/routes",
+                                   params={"depth": "2"})
+        except ArubaAPIError:
+            return True  # can't verify -> don't fail the whole apply on this alone
+        for prefix, route in self._collection_items(data or {}):
+            if prefix == network and isinstance(route, dict) and \
+               route.get("from", route.get("protocol")) == "connected":
+                return True
+        return False
+
+    async def set_interface_admin(self, name: str, enable: bool = True) -> dict:
+        """Admin up/down a plain L2 (or any) interface WITHOUT touching its
+        routing/IP/VLAN configuration \u2014 a thin complement to
+        configure_routed_port/configure_lag for ports that are neither routed
+        nor a LAG member (e.g. a plain access/trunk port)."""
+        path = f"/system/interfaces/{quote(name, safe='')}"
+        target = "up" if enable else "down"
+        await self._put_merge(path, {"user_config": {"admin": target}})
+        ok, flapped = await self._ensure_operational_admin(path, target)
+        result = {"interface": name, "admin": target,
+                  "status": "updated" if ok else "partial"}
+        if flapped:
+            result["admin_flapped"] = True
+        if not ok:
+            result["warning"] = (
+                f"configured admin '{target}' but the operational admin_state did "
+                "not follow after a down/up flap; check l1_state_down_reason with "
+                "get_interfaces(scope='physical').")
+        return result
+
+    async def reset_routed_interface(self, name: str, *, shutdown: bool = True) -> dict:
+        """Undo configure_routed_interface: drop the IP, move the port back to
+        the default VRF and (by default) shut it. Idempotent; absent-safe."""
+        path = f"/system/interfaces/{quote(name, safe='')}"
+        body = {"ip4_address": None,
+                "vrf": {"default": self._uri("/system/vrfs/default")},
+                "user_config": {"admin": "down" if shutdown else "up"}}
+        try:
+            await self._put_merge(path, body)
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return {"interface": name, "status": "absent"}
+            raise
+        return {"interface": name, "status": "reset"}
+
+    # ─── Domain: L2 access port (+ per-port spanning-tree options) ────────────
+
+    _STP_PORT_FIELDS = {
+        "admin_edge_port_enable", "bpdu_guard_enable", "root_guard_enable",
+        "loop_guard_enable", "bpdu_filter_enable", "admin_path_cost", "link_type",
+        "bpdus_rx_disable", "bpdus_tx_disable",
+    }
+
+    async def configure_l2_access_port(self, name: str, *,
+                                       access_vlan: Optional[int] = None,
+                                       voice_vlan: Optional[int] = None,
+                                       description: Optional[str] = None,
+                                       enable: Optional[bool] = True,
+                                       stp: Optional[dict] = None,
+                                       extra: Optional[dict] = None) -> dict:
+        """Turn a port into an L2 access port (idempotent read-modify-write):
+        `no routing`, `vlan access <access_vlan>` (or, with `voice_vlan`,
+        `vlan trunk native <access_vlan>` + `vlan trunk allowed <voice_vlan>`),
+        description, admin state and per-port spanning-tree options (`stp`:
+        {admin_edge_port_enable, bpdu_guard_enable, root_guard_enable,
+        loop_guard_enable, bpdu_filter_enable, admin_path_cost, link_type})."""
+        if access_vlan is not None:
+            access_vlan = _v_vlan(access_vlan, "access_vlan")
+        if voice_vlan is not None:
+            voice_vlan = _v_vlan(voice_vlan, "voice_vlan")
+        for k in (stp or {}):
+            if k not in self._STP_PORT_FIELDS:
+                raise ArubaAPIError(
+                    f"Unknown spanning-tree port option '{k}'. Valid: "
+                    f"{sorted(self._STP_PORT_FIELDS)}", 400)
+        path = f"/system/interfaces/{quote(name, safe='')}"
+        body = await self._read_writable(path)
+        if body is None:
+            raise ArubaAPIError(f"Interface '{name}' not found.", 404)
+        changes: dict[str, Any] = {"routing": False}
+        if body.get("routing"):
+            body["ip4_address"] = None
+            body["vrf"] = None
+        if access_vlan is not None:
+            changes["vlan_tag"] = {str(access_vlan): self._uri(f"/system/vlans/{access_vlan}")}
+        if voice_vlan is not None:
+            changes["vlan_mode"] = "native-untagged"
+            changes["vlan_trunks"] = {str(voice_vlan): self._uri(f"/system/vlans/{voice_vlan}")}
+        elif access_vlan is not None:
+            changes["vlan_mode"] = "access"
+            body["vlan_trunks"] = {}
+        if description is not None:
+            changes["description"] = description
+        if enable is not None:
+            changes["user_config"] = {"admin": "up" if enable else "down"}
+        if stp:
+            changes["stp_config"] = dict(stp)
+        if extra:
+            changes.update({k: v for k, v in extra.items() if v is not None})
+        self._deep_merge(body, changes)
+        await self._put(path, body)
+        return {"interface": name, "access_vlan": access_vlan, "voice_vlan": voice_vlan,
+                "stp": stp or {}, "admin": (changes.get("user_config") or {}).get("admin"),
+                "status": "configured"}
+
+    async def reset_l2_access_port(self, name: str, *, shutdown: bool = False) -> dict:
+        """Return an access port to defaults: VLAN 1 access, no description, all
+        spanning-tree port options cleared. Idempotent; absent-safe."""
+        path = f"/system/interfaces/{quote(name, safe='')}"
+        body: dict[str, Any] = {
+            "routing": False, "vlan_mode": "access",
+            "vlan_tag": {"1": self._uri("/system/vlans/1")}, "vlan_trunks": {},
+            "description": "",
+            "stp_config": {k: False for k in ("admin_edge_port_enable", "bpdu_guard_enable",
+                                              "root_guard_enable", "loop_guard_enable",
+                                              "bpdu_filter_enable")},
+        }
+        if shutdown:
+            body["user_config"] = {"admin": "down"}
+        try:
+            await self._put_merge(path, body)
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return {"interface": name, "status": "absent"}
+            raise
+        return {"interface": name, "status": "reset"}
+
+    async def read_access_port(self, name: str) -> dict:
+        """Read back an access port: L2 mode/VLANs, admin, STP port options and
+        the port-access (802.1X / MAC-auth) configuration."""
+        encoded = quote(name, safe="")
+        iface = await self._get_config(f"/system/interfaces/{encoded}", depth=2)
+        if iface is None:
+            return {"interface": name, "present": False}
+        auth = await self.read_port_auth(name)
+        return {"interface": name, "present": True,
+                "routing": iface.get("routing"),
+                "vlan_mode": iface.get("vlan_mode"),
+                "access_vlan": self._ref_name(iface.get("vlan_tag")),
+                "trunk_vlans": sorted((iface.get("vlan_trunks") or {}).keys())
+                if isinstance(iface.get("vlan_trunks"), dict) else iface.get("vlan_trunks"),
+                "description": iface.get("description"),
+                "admin": (iface.get("user_config") or {}).get("admin"),
+                "stp": {k: v for k, v in (iface.get("stp_config") or {}).items()
+                        if k in self._STP_PORT_FIELDS},
+                "port_access": {k: v for k, v in auth.items() if k not in ("interface", "present")}}
+
+    # ─── Domain: LAG (Link Aggregation Group / port-channel) ──────────────────
+
+    _LAG_MODES = ("static", "lacp-active", "lacp-passive")
+    _VLAN_MODES = ("access", "trunk", "native-tagged", "native-untagged")
+
+    async def _find_lag_containing(self, interface: str) -> Optional[str]:
+        """Return the name of the LAG that currently bundles `interface` as a
+        member, or None if it isn't a member of any LAG."""
+        try:
+            data = await self._get("/system/interfaces", params={"depth": "2"})
+        except ArubaAPIError:
+            return None
+        for lag_name, iface in self._collection_items(data or {}):
+            if isinstance(iface, dict) and iface.get("type") == "lag" and \
+               interface in (iface.get("interfaces") or {}):
+                return lag_name
+        return None
+
+    async def remove_member_from_lag(self, interface: str, *,
+                                     delete_if_empty: bool = False) -> dict:
+        """Remove `interface` from whichever LAG currently bundles it
+        (idempotent; no-op if it isn't a member of any LAG). Used to convert a
+        LAG member port to a standalone routed port in one operation instead
+        of requiring a separate manual 'no lag' step first.
+
+        Only the LAG's member map is rewritten — the LAG mode (LACP/static),
+        admin state and other settings are left untouched. `delete_if_empty`
+        removes the LAG itself once its last member is gone (on 8360 an empty
+        LAG keeps its ex-members in `pspo_enablement_layer_down`)."""
+        lag_name = await self._find_lag_containing(interface)
+        if lag_name is None:
+            return {"interface": interface, "lag": None, "status": "not_a_member"}
+        path = f"/system/interfaces/{quote(lag_name, safe='')}"
+        existing = await self._read_writable(path) or {}
+        member_map = dict(existing.get("interfaces") or {})
+        member_map.pop(interface, None)
+        existing["interfaces"] = member_map
+        await self._put(path, existing)
+        await self._clear_lacp_aggregation_key([interface])
+        result = {"interface": interface, "lag": lag_name, "status": "removed",
+                  "remaining_members": sorted(member_map), "lag_deleted": False}
+        if delete_if_empty and not member_map:
+            await self.delete_interface(lag_name)
+            result["lag_deleted"] = True
+        return result
+
+    async def release_lag_members(self, interfaces: list[str], *,
+                                  delete_empty: bool = False) -> dict:
+        """Batch form of remove_member_from_lag: pull every port in
+        `interfaces` out of its LAG (one PUT per LAG), then delete the LAGs left
+        without members when `delete_empty` (MC-LAG: run on each VSX peer).
+        Returns {released: {iface: lag}, lags_deleted, lags_left_empty}."""
+        wanted = set(interfaces or [])
+        try:
+            data = await self._get("/system/interfaces", params={"depth": "2"})
+        except ArubaAPIError:
+            data = {}
+        per_lag: dict[str, list[str]] = {}
+        for lag_name, iface in self._collection_items(data or {}):
+            if isinstance(iface, dict) and iface.get("type") == "lag":
+                hit = sorted(wanted & set(iface.get("interfaces") or {}))
+                if hit:
+                    per_lag[lag_name] = hit
+        released: dict[str, str] = {}
+        deleted: list[str] = []
+        left_empty: list[str] = []
+        for lag_name, ports in per_lag.items():
+            path = f"/system/interfaces/{quote(lag_name, safe='')}"
+            existing = await self._read_writable(path) or {}
+            member_map = dict(existing.get("interfaces") or {})
+            for p in ports:
+                member_map.pop(p, None)
+                released[p] = lag_name
+            existing["interfaces"] = member_map
+            await self._put(path, existing)
+            await self._clear_lacp_aggregation_key(ports)
+            if not member_map:
+                if delete_empty:
+                    await self.delete_interface(lag_name)
+                    deleted.append(lag_name)
+                else:
+                    left_empty.append(lag_name)
+        out = {"released": released, "lags_deleted": deleted,
+               "lags_left_empty": left_empty,
+               "status": "released" if released else "noop"}
+        if left_empty:
+            out["warning"] = (f"LAG(s) {left_empty} now have no member and were kept; "
+                              "pass delete_empty_lags=true to remove them (on 8360 an "
+                              "empty LAG can keep its ex-members down).")
+        return out
+
+    async def configure_lag(self, lag_id, *, members: Optional[list[str]] = None,
+                            remove_members: Optional[list[str]] = None,
+                            mode: str = "static", lacp_rate: Optional[str] = None,
+                            lacp_fallback: Optional[bool] = None,
+                            mclag_enabled: Optional[bool] = None,
+                            vlan_mode: Optional[str] = None,
+                            access_vlan: Optional[int] = None,
+                            native_vlan: Optional[int] = None,
+                            trunk_vlans: Optional[list[int]] = None,
+                            evpn_multihoming_esi: Optional[str] = None,
+                            evpn_multihoming_es_rd: Optional[str] = None,
+                            evpn_multihoming_es_import_rt: Optional[str] = None,
+                            description: Optional[str] = None,
+                            mtu: Optional[int] = None,
+                            enable: bool = True, delete: bool = False) -> dict:
+        """Create/update (or delete) a LAG (idempotent). One primitive covers
+        every flavour:
+          - standard static LAG:      mode='static'
+          - standard LACP LAG:        mode='lacp-active'|'lacp-passive'
+          - multi-chassis LAG (MC-LAG/VSX): add mclag_enabled=True and apply the
+            SAME lag_id/members/mode on both VSX peers
+          - EVPN Multihoming (ESI-LAG): add evpn_multihoming_esi (+ es_rd /
+            es_import_rt); requires the global `multihoming_system_id` set once
+            on every VTEP (see set_evpn_global)
+        `members`/`remove_members` are merged into the LAG's existing member
+        set (not replaced), so repeated calls are additive/idempotent.
+        `delete=True` removes the LAG (idempotent, no-op if already absent)."""
+        name = _v_lag_name(lag_id)
+        encoded = quote(name, safe="")
+        path = f"/system/interfaces/{encoded}"
+        if delete:
+            existing_for_delete = await self._read_writable(path)
+            members_to_clean = sorted((existing_for_delete or {}).get("interfaces") or {})
+            result = await self.delete_interface(name)
+            await self._clear_lacp_aggregation_key(members_to_clean)
+            return result
+        if mode not in self._LAG_MODES:
+            raise ArubaAPIError(
+                f"Invalid mode '{mode}'. Expected one of {self._LAG_MODES}.", 400)
+        if lacp_rate is not None and lacp_rate not in ("fast", "slow"):
+            raise ArubaAPIError(
+                f"Invalid lacp_rate '{lacp_rate}'. Expected 'fast' or 'slow'.", 400)
+        if vlan_mode is not None and vlan_mode not in self._VLAN_MODES:
+            raise ArubaAPIError(
+                f"Invalid vlan_mode '{vlan_mode}'. Expected one of "
+                f"{self._VLAN_MODES}.", 400)
+        if evpn_multihoming_esi is not None:
+            evpn_multihoming_esi = _v_esi(evpn_multihoming_esi)
+        if mtu is not None:
+            mtu = _v_mtu(mtu, "mtu")
+
+        changes: dict[str, Any] = {
+            "lacp": None if mode == "static" else mode.split("-", 1)[1],
+            "admin": "up" if enable else "down",
+        }
+        if description is not None:
+            changes["description"] = description
+        if mtu is not None:
+            changes["user_config"] = {"mtu": int(mtu)}
+        other_config: dict[str, Any] = {}
+        if lacp_rate is not None:
+            other_config["lacp-time"] = lacp_rate
+        if lacp_fallback is not None:
+            other_config["lacp-fallback"] = lacp_fallback
+        if mclag_enabled is not None:
+            other_config["mclag_enabled"] = mclag_enabled
+        if other_config:
+            changes["other_config"] = other_config
+        if vlan_mode is not None:
+            changes["vlan_mode"] = vlan_mode
+        if access_vlan is not None:
+            vid = _v_vlan(access_vlan, "access_vlan")
+            changes["vlan_tag"] = {str(vid): self._uri(f"/system/vlans/{vid}")}
+        if native_vlan is not None:
+            vid = _v_vlan(native_vlan, "native_vlan")
+            changes["vlan_tag"] = {str(vid): self._uri(f"/system/vlans/{vid}")}
+        if trunk_vlans is not None:
+            changes["vlan_trunks"] = {
+                str(vid): self._uri(f"/system/vlans/{vid}")
+                for vid in (_v_vlan(v, "trunk_vlan") for v in trunk_vlans)}
+        if evpn_multihoming_esi is not None:
+            changes["evpn_multihoming_esi"] = evpn_multihoming_esi
+        if evpn_multihoming_es_rd is not None:
+            changes["evpn_multihoming_es_rd"] = evpn_multihoming_es_rd
+        if evpn_multihoming_es_import_rt is not None:
+            changes["evpn_multihoming_es_import_rt"] = evpn_multihoming_es_import_rt
+
+        existing = await self._read_writable(path)
+        member_map = dict(existing.get("interfaces") or {}) if existing else {}
+        for m in (members or []):
+            member_map[m] = self._uri(f"/system/interfaces/{quote(m, safe='')}")
+        for m in (remove_members or []):
+            member_map.pop(m, None)
+        if members or remove_members or existing is None:
+            changes["interfaces"] = member_map
+
+        if existing is None:
+            if not member_map:
+                raise ArubaAPIError(
+                    "Creating a LAG requires at least one member interface "
+                    "(pass `members`).", 400)
+            body = {"name": name, "type": "lag", **changes}
+            await self._post("/system/interfaces", body)
+            status = "created"
+        else:
+            # "interfaces" must be a full REPLACE, not a recursive merge:
+            # _deep_merge only adds/overwrites nested keys, it never removes
+            # one — so a `remove_members` pop from member_map would otherwise
+            # silently survive the merge and stay bundled in the LAG.
+            interfaces_replacement = changes.pop("interfaces", None)
+            self._deep_merge(existing, changes)
+            if interfaces_replacement is not None:
+                existing["interfaces"] = interfaces_replacement
+            await self._put(path, existing)
+            status = "updated"
+        if remove_members:
+            await self._clear_lacp_aggregation_key(remove_members)
+        return {"lag": name, "mode": mode, "members": sorted(member_map.keys()),
+                "mclag_enabled": mclag_enabled,
+                "evpn_multihoming_esi": evpn_multihoming_esi, "status": status}
 
     # ─── Domain: VXLAN (VTEP interface + static peers) ────────────────────────
 
@@ -6187,15 +7042,88 @@ class ArubaOSCXClient:
             body["inter_vxlan_bridging_mode"] = inter_vxlan_bridging_mode
         if extra:
             body.update({k: v for k, v in extra.items() if v is not None})
+        path = f"/system/interfaces/{encoded}"
         if await self.interface_exists(name):
+            current = await self._get_config(path) or {}
+            # CLI-created vxlan1 carries BOTH the top-level `admin` and
+            # user_config.admin; without the top-level one the VTEP stays down.
+            if current.get("admin") != "up":
+                body["admin"] = "up"
             if body:
-                await self._put(f"/system/interfaces/{encoded}", body)
+                await self._put_merge(path, body)
             return {"interface": name, "source_ip": options.get("local_ip"),
                     "status": "updated" if body else "already_exists"}
-        create_body = {"name": name, "user_config": {"admin": "up"}, **body}
+        options.setdefault("vxlan_dest_udp_port", "4789")
+        body["options"] = options
+        create_body = {"name": name, "type": "vxlan", "admin": "up",
+                       "user_config": {"admin": "up"}, **body}
         await self._post("/system/interfaces", create_body)
         return {"interface": name, "source_ip": options.get("local_ip"),
                 "status": "created"}
+
+    async def loopback_ip(self, name: str = "loopback0") -> str:
+        """Host address of a loopback (used for router-id / RD 'auto')."""
+        data = await self._get_config(f"/system/interfaces/{quote(name, safe='')}")
+        ip = (data or {}).get("ip4_address")
+        if isinstance(ip, dict):
+            ip = next(iter(ip), None)
+        if not ip:
+            raise ArubaAPIError(
+                f"'{name}' has no IPv4 address on {self.host} — cannot derive the "
+                "router-id/RD from it; configure it first or pass an explicit value.", 404)
+        return str(ip).split("/")[0]
+
+    async def check_vxlan_operational(self, name: str = "vxlan1", *,
+                                      attempts: int = 4, interval: float = 3) -> dict:
+        """Post-apply check of the VTEP: interface forwarding state, VNI `state`
+        and EVPN instance `operational_status` (CLI: show interface vxlan1 /
+        show evpn evi summary). Retries a few times to let the daemons settle."""
+        path = f"/system/interfaces/{quote(name, safe='')}"
+        report: dict = {}
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                await asyncio.sleep(interval)
+            problems: list[str] = []
+            try:
+                iface = await self._get(path, params={"depth": "1"})
+            except ArubaAPIError as exc:
+                return {"interface": name, "operational": False,
+                        "problems": [f"cannot read {name}: {exc}"]}
+            fwd = iface.get("forwarding_state") if isinstance(iface, dict) else None
+            fwd = fwd if isinstance(fwd, dict) else {}
+            if fwd and not (fwd.get("operational") and fwd.get("enablement")):
+                problems.append(f"{name} not operational (forwarding_state={fwd})")
+            if isinstance(iface, dict) and iface.get("admin") not in (None, "up"):
+                problems.append(f"{name} admin={iface.get('admin')}")
+            bad_vnis = {}
+            try:
+                vnis = await self._get("/system/virtual_network_ids",
+                                       params={"depth": "2", "selector": "status"})
+                for key, v in self._collection_items(vnis or {}):
+                    state = v.get("state") if isinstance(v, dict) else None
+                    if state and state != "operational":
+                        bad_vnis[unquote(str(key))] = state
+            except ArubaAPIError:
+                pass
+            bad_evis = {}
+            try:
+                evis = await self._get("/system/evpn_instances", params={"depth": "2"})
+                for key, e in self._collection_items(evis or {}):
+                    st = e.get("operational_status") if isinstance(e, dict) else None
+                    if st and str(st).lower() != "up":
+                        bad_evis[str(key)] = st
+            except ArubaAPIError:
+                pass
+            if bad_vnis:
+                problems.append(f"VNI(s) not operational: {bad_vnis}")
+            if bad_evis:
+                problems.append(f"EVI(s) not up: {bad_evis}")
+            report = {"interface": name, "operational": not problems,
+                      "forwarding_state": fwd or None, "problems": problems,
+                      "attempts": attempt + 1}
+            if not problems:
+                break
+        return report
 
     async def add_static_vxlan_peer(self, destination: str, vnis: list, *,
                                     vxlan_interface: str = "vxlan1",
@@ -6220,7 +7148,7 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put(f"{base}/{key}", {"network_id": network_id})
+            await self._put_merge(f"{base}/{key}", {"network_id": network_id})
             action = "updated"
         else:
             await self._post(base, {
@@ -6272,12 +7200,12 @@ class ArubaOSCXClient:
         the VRF carries the L3 route-distinguisher (`rd`) and the EVPN
         route-targets (`evpn_import_rts`/`evpn_export_rts`)."""
         if rd is not None:
-            rd = _v_route_target(rd, "rd")
+            rd = _v_vrf_rd(rd, "rd")
         if evpn_import_rts is not None:
-            evpn_import_rts = [_v_route_target(r, "evpn_import_rt")
+            evpn_import_rts = [_v_vrf_route_target(r, "evpn_import_rt")
                                for r in evpn_import_rts]
         if evpn_export_rts is not None:
-            evpn_export_rts = [_v_route_target(r, "evpn_export_rt")
+            evpn_export_rts = [_v_vrf_route_target(r, "evpn_export_rt")
                                for r in evpn_export_rts]
         config: dict[str, Any] = {}
         if rd is not None:
@@ -6290,11 +7218,21 @@ class ArubaOSCXClient:
             config.update({k: v for k, v in extra.items() if v is not None})
         if await self.vrf_exists(name):
             if config:
-                await self._put(f"/system/vrfs/{quote(name, safe='')}", config)
-            return {"vrf": name, "status": "updated" if config else "already_exists",
-                    "config": config}
-        await self._post("/system/vrfs", {"name": name, "type": vrf_type, **config})
-        return {"vrf": name, "status": "created", "config": config}
+                await self._put_merge(f"/system/vrfs/{quote(name, safe='')}", config)
+            result = {"vrf": name, "status": "updated" if config else "already_exists",
+                      "config": config}
+        else:
+            await self._post("/system/vrfs", {"name": name, "type": vrf_type, **config})
+            result = {"vrf": name, "status": "created", "config": config}
+        wanted = {k: v for k, v in config.items()
+                  if k in ("rd", "evpn_import_route_targets", "evpn_export_route_targets")}
+        if wanted:
+            got = await self._read_writable(f"/system/vrfs/{quote(name, safe='')}") or {}
+            missing = self._subset_mismatches(wanted, got)
+            if missing:
+                result["warning"] = f"VRF '{name}' written but not kept by the device: {missing}"
+                result["not_applied"] = missing
+        return result
 
     async def set_vrf_address_family(self, vrf: str,
                                      address_family: str = "ipv4-unicast", *,
@@ -6324,11 +7262,20 @@ class ArubaOSCXClient:
                 raise
         if exists:
             if config:
-                await self._put(f"{base}/{key}", config)
+                await self._put_merge(f"{base}/{key}", config)
             action = "updated" if config else "already_exists"
         else:
-            await self._post(base, {"address_family": address_family, **config})
-            action = "created"
+            try:
+                await self._post(base, {"address_family": address_family, **config})
+                action = "created"
+            except ArubaAPIError as exc:
+                if exc.status_code != 500:
+                    raise
+                raise ArubaAPIError(
+                    f"VRF address-family '{address_family}' of '{vrf}' could not be "
+                    f"created over REST on {self.host} ({exc.args[0] if exc.args else exc}). "
+                    "For EVPN route-targets use the VRF-level import/export_route_targets "
+                    "(no address_families entry needed).", 500) from exc
         return {"vrf": vrf, "address_family": address_family, "status": action}
 
     async def delete_vrf(self, name: str) -> dict:
@@ -6342,6 +7289,376 @@ class ArubaOSCXClient:
             if exc.status_code == 404:
                 return {"vrf": name, "deleted": False, "status": "absent"}
             raise
+
+    # ─── Domain: Static routes (per VRF) ───────────────────────────────────────
+
+    async def configure_static_route(self, prefix: str, *, vrf: str = "default",
+                                     nexthops: Optional[list] = None,
+                                     name: Optional[str] = None) -> dict:
+        """Create/update a static route and its nexthops (idempotent).
+
+        `nexthops`: list of {ip_address, port, type ('forward'|'nullroute'|
+        'reject', default 'forward'), distance, tag, bfd_enable,
+        use_forwarding_address} — the FULL desired set (indices 0..N-1); any
+        previously configured nexthop index not present in the new list is
+        removed."""
+        prefix = _v_ipv4_cidr(prefix, "prefix")
+        base = f"/system/vrfs/{quote(vrf, safe='')}/static_routes"
+        key = quote(prefix, safe="")
+        route_config: dict[str, Any] = {}
+        if name is not None:
+            route_config["name"] = name
+        exists = False
+        try:
+            await self._get(f"{base}/{key}", params={"depth": "1"})
+            exists = True
+        except ArubaAPIError as exc:
+            if exc.status_code != 404:
+                raise
+        if exists:
+            if route_config:
+                await self._put_merge(f"{base}/{key}", route_config)
+            action = "updated" if route_config else "already_exists"
+        else:
+            await self._post(base, {
+                "prefix": prefix,
+                "vrf": self._uri(f"/system/vrfs/{quote(vrf, safe='')}"),
+                **route_config})
+            action = "created"
+
+        nh_base = f"{base}/{key}/static_nexthops"
+        nh_results: list[dict] = []
+        if nexthops is not None:
+            existing_ids: set[int] = set()
+            try:
+                current = await self._get(nh_base, params={"depth": "1"})
+                if isinstance(current, dict):
+                    existing_ids = {int(k) for k in current if str(k).lstrip("-").isdigit()}
+            except ArubaAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+            wanted_ids: set[int] = set()
+            for idx, nh in enumerate(nexthops):
+                nh_id = int(nh.get("id", idx))
+                wanted_ids.add(nh_id)
+                nh_body: dict[str, Any] = {"id": nh_id,
+                                           "type": nh.get("type", "forward")}
+                if nh.get("ip_address") is not None:
+                    nh_body["ip_address"] = _v_ip_host(nh["ip_address"], "ip_address")
+                if nh.get("port") is not None:
+                    nh_body["port"] = self._uri(
+                        f"/system/interfaces/{quote(nh['port'], safe='')}")
+                if nh.get("distance") is not None:
+                    nh_body["distance"] = _v_int_range(nh["distance"], 1, 255, "distance")
+                if nh.get("tag") is not None:
+                    nh_body["tag"] = _v_int_range(nh["tag"], 1, 4294967295, "tag")
+                if nh.get("bfd_enable") is not None:
+                    nh_body["bfd_enable"] = bool(nh["bfd_enable"])
+                if nh.get("use_forwarding_address") is not None:
+                    nh_body["use_forwarding_address"] = bool(nh["use_forwarding_address"])
+                nh_key = quote(str(nh_id), safe="")
+                if nh_id in existing_ids:
+                    await self._put_merge(f"{nh_base}/{nh_key}", nh_body)
+                    nh_results.append({"id": nh_id, "status": "updated"})
+                else:
+                    await self._post(nh_base, nh_body)
+                    nh_results.append({"id": nh_id, "status": "created"})
+            for stale_id in existing_ids - wanted_ids:
+                try:
+                    await self._delete(f"{nh_base}/{quote(str(stale_id), safe='')}")
+                    nh_results.append({"id": stale_id, "status": "deleted"})
+                except ArubaAPIError as exc:
+                    if exc.status_code != 404:
+                        raise
+        return {"prefix": prefix, "vrf": vrf, "status": action, "nexthops": nh_results}
+
+    async def delete_static_route(self, prefix: str, vrf: str = "default") -> dict:
+        """Delete a static route (and its nexthops) if present."""
+        prefix = _v_ipv4_cidr(prefix, "prefix")
+        key = quote(prefix, safe="")
+        try:
+            await self._delete(f"/system/vrfs/{quote(vrf, safe='')}/static_routes/{key}")
+            return {"prefix": prefix, "vrf": vrf, "deleted": True, "status": "deleted"}
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return {"prefix": prefix, "vrf": vrf, "deleted": False, "status": "absent"}
+            raise
+
+    # ─── Domain: DHCP relay (per {vrf, L3 port/SVI}) ───────────────────────────
+
+    async def configure_dhcp_relay(self, interface: str, *, vrf: str = "default",
+                                   ipv4_servers: Optional[list] = None,
+                                   ipv6_servers: Optional[list] = None,
+                                   bootp_gateway: Optional[str] = None) -> dict:
+        """Create/update the DHCP relay (helper-address) on an L3 port/SVI
+        (idempotent). `ipv4_servers`/`ipv6_servers`: the FULL desired list of
+        DHCP server destinations (replaces any existing list, up to 8 each)."""
+        if ipv4_servers is not None:
+            ipv4_servers = [_v_ip_host(s, "ipv4_servers") for s in ipv4_servers]
+        if ipv6_servers is not None:
+            ipv6_servers = [_v_ip_host(s, "ipv6_servers") for s in ipv6_servers]
+        base = "/system/dhcp_relays"
+        key = quote(f"{vrf},{interface}", safe="")
+        body: dict[str, Any] = {}
+        if ipv4_servers is not None:
+            body["ipv4_ucast_server"] = ipv4_servers
+        if ipv6_servers is not None:
+            body["ipv6_ucast_server"] = ipv6_servers
+        if bootp_gateway is not None:
+            body["other_config"] = {"bootp_gateway": bootp_gateway}
+        exists = False
+        try:
+            await self._get(f"{base}/{key}", params={"depth": "1"})
+            exists = True
+        except ArubaAPIError as exc:
+            if exc.status_code != 404:
+                raise
+        if exists:
+            if body:
+                await self._put_merge(f"{base}/{key}", body)
+            action = "updated" if body else "already_exists"
+        else:
+            await self._post(base, {
+                "port": self._uri(f"/system/interfaces/{quote(interface, safe='')}"),
+                "vrf": self._uri(f"/system/vrfs/{quote(vrf, safe='')}"),
+                **body})
+            action = "created"
+        return {"interface": interface, "vrf": vrf, "status": action}
+
+    async def delete_dhcp_relay(self, interface: str, vrf: str = "default") -> dict:
+        """Delete the DHCP relay config on an L3 port/SVI, if present."""
+        key = quote(f"{vrf},{interface}", safe="")
+        try:
+            await self._delete(f"/system/dhcp_relays/{key}")
+            return {"interface": interface, "vrf": vrf, "deleted": True, "status": "deleted"}
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return {"interface": interface, "vrf": vrf, "deleted": False,
+                        "status": "absent"}
+            raise
+
+    async def read_dhcp_relay(self, interface: str, vrf: str = "default") -> dict:
+        """Verify the DHCP relay config on an L3 port/SVI."""
+        key = quote(f"{vrf},{interface}", safe="")
+        data = await self._get_config(f"/system/dhcp_relays/{key}")
+        if data is None:
+            return {"interface": interface, "vrf": vrf, "present": False}
+        return {"interface": interface, "vrf": vrf, "present": True,
+                "ipv4_servers": data.get("ipv4_ucast_server") or [],
+                "ipv6_servers": data.get("ipv6_ucast_server") or [],
+                "bootp_gateway": (data.get("other_config") or {}).get("bootp_gateway")}
+
+    async def list_dhcp_relays(self, interface: Optional[str] = None) -> list[dict]:
+        """Discover ALL configured DHCP relays on this device (or just the given
+        interface's, if provided) \u2014 keys are `{vrf},{port}` pairs, there is no
+        single collection filter for 'port', so this fans out client-side."""
+        try:
+            raw = await self._get("/system/dhcp_relays", params={"depth": "1"})
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return []
+            raise
+        out: list[dict] = []
+        if isinstance(raw, dict):
+            for key in raw:
+                parts = unquote(str(key)).split(",", 1)
+                if len(parts) != 2:
+                    continue
+                r_vrf, r_port = parts
+                if interface and r_port != interface:
+                    continue
+                out.append(await self.read_dhcp_relay(r_port, vrf=r_vrf))
+        return out
+
+    # ─── Domain: interface groups (system interface-group speed) ───────────────
+    # Interface groups are blocks of ports on a subsystem (line card / chassis)
+    # that share a single selectable link speed (e.g. a group is 10g OR 25g, not
+    # both at once). Modelled on the Subsystem resource: `interface_group_speed`
+    # (writable map {group: speed}, = CLI `system interface-group <id> speed
+    # <speed>`), plus read-only `interface_group_applied_speed`/`_default_speed`/
+    # `_info` (per-group supported speeds).
+
+    _IFACE_GROUP_SPEEDS = ("5g", "10g", "25g", "40g", "50g", "100g", "200g")
+
+    @staticmethod
+    def _subsystem_match(key: str, wanted: str) -> bool:
+        """True when `wanted` designates the subsystem `key` ('type,name') — by
+        full key, by 'type,name', or by bare name (e.g. '1/1')."""
+        stype, sname = _parse_subsystem_key(key)
+        w = (wanted or "").strip()
+        return w in (key, sname, f"{stype},{sname}")
+
+    async def _iface_group_subsystems(self) -> list[tuple[str, dict]]:
+        """List the subsystems that actually USE interface groups (non-empty
+        `interface_group_info`), each fetched at depth=2 so the
+        interface_group_* maps are inlined. Parallel, bounded concurrency."""
+        listing = await self._get("/system/subsystems", params={"depth": "1"})
+        keys = [str(key) for key, _ in self._collection_items(listing)]
+        sem = asyncio.Semaphore(8)
+
+        async def _fetch(key: str) -> tuple[str, Any]:
+            async with sem:
+                try:
+                    sub = await self._get(f"/system/subsystems/{quote(key, safe='')}",
+                                          params={"depth": "2"})
+                except ArubaAPIError:
+                    return key, None
+                return key, sub
+
+        fetched = await asyncio.gather(*[_fetch(k) for k in keys])
+        return [(k, sub) for k, sub in fetched
+                if isinstance(sub, dict) and sub.get("interface_group_info")]
+
+    @staticmethod
+    def _format_iface_groups(key: str, sub: dict) -> list[dict]:
+        """One entry per interface group on a subsystem: configured / applied /
+        default speed + the speeds that group supports."""
+        stype, sname = _parse_subsystem_key(key)
+        info = sub.get("interface_group_info") or {}
+        configured = sub.get("interface_group_speed") or {}
+        applied = sub.get("interface_group_applied_speed") or {}
+        default = sub.get("interface_group_default_speed") or {}
+
+        def _grp_sort(g: str):
+            return (0, int(g)) if str(g).isdigit() else (1, str(g))
+
+        out: list[dict] = []
+        for grp in sorted(info.keys(), key=_grp_sort):
+            speeds = info.get(grp)
+            supported = sorted(speeds.keys()) if isinstance(speeds, dict) else []
+            out.append({
+                "subsystem": key,
+                "type": stype,
+                "name": sname,
+                "group": str(grp),
+                "configured_speed": configured.get(grp),
+                "applied_speed": applied.get(grp),
+                "default_speed": default.get(grp),
+                "supported_speeds": supported,
+            })
+        return out
+
+    async def list_interface_groups(self, subsystem: Optional[str] = None) -> list[dict]:
+        """Discover the interface (port-group) speed settings on this device.
+        Optionally restrict to one `subsystem` ('line_card,1/1' or bare '1/1').
+        Empty list on platforms that do not use interface groups."""
+        subs = await self._iface_group_subsystems()
+        out: list[dict] = []
+        for key, sub in subs:
+            if subsystem and not self._subsystem_match(key, subsystem):
+                continue
+            out.extend(self._format_iface_groups(key, sub))
+        return out
+
+    async def _resolve_iface_group_subsystem(
+            self, subsystem: Optional[str]) -> tuple[str, dict]:
+        """Resolve the target subsystem for an interface-group write. When
+        `subsystem` is omitted and exactly one subsystem uses interface groups,
+        pick it; otherwise require disambiguation."""
+        subs = await self._iface_group_subsystems()
+        matches = [(k, s) for k, s in subs
+                   if subsystem is None or self._subsystem_match(k, subsystem)]
+        if not matches:
+            if subsystem:
+                raise ArubaAPIError(
+                    f"No interface-group-capable subsystem matches "
+                    f"'{subsystem}' on {self.host}.", 404)
+            raise ArubaAPIError(
+                f"Device {self.host} has no configurable interface groups.", 404)
+        if len(matches) > 1:
+            raise ArubaAPIError(
+                f"Ambiguous subsystem: interface groups exist on "
+                f"{[k for k, _ in matches]}. Pass `subsystem` to disambiguate.", 400)
+        return matches[0]
+
+    async def configure_interface_group(self, group, speed: Optional[str] = None, *,
+                                        subsystem: Optional[str] = None,
+                                        delete: bool = False) -> dict:
+        """Set (or reset) the link speed of an interface group on a subsystem —
+        the CLI `system interface-group <id> speed <speed>`. Idempotent.
+        `delete=True` resets the group to its default (removes the override).
+        Changing a group's speed can bounce every port in that block."""
+        group = str(group).strip()
+        key, sub = await self._resolve_iface_group_subsystem(subsystem)
+        info = sub.get("interface_group_info") or {}
+        if group not in info:
+            raise ArubaAPIError(
+                f"'{group}' is not an interface group on subsystem '{key}'. "
+                f"Valid groups: {sorted(info.keys())}.", 400)
+        path = f"/system/subsystems/{quote(key, safe='')}"
+
+        if delete:
+            writable = await self._read_writable(path, depth=2) or {}
+            speeds = dict(writable.get("interface_group_speed") or {})
+            if group not in speeds:
+                return {"subsystem": key, "group": group, "status": "absent"}
+            speeds.pop(group, None)
+            writable["interface_group_speed"] = speeds
+            await self._put(path, writable)
+            return {"subsystem": key, "group": group, "status": "deleted"}
+
+        if speed is None:
+            raise ArubaAPIError("`speed` is required unless delete=True.", 400)
+        speed = str(speed).lower().strip()
+        if speed not in self._IFACE_GROUP_SPEEDS:
+            raise ArubaAPIError(
+                f"Invalid speed '{speed}'. Use one of: "
+                f"{', '.join(self._IFACE_GROUP_SPEEDS)}.", 400)
+        supported = info.get(group) or {}
+        if isinstance(supported, dict) and supported and speed not in supported:
+            raise ArubaAPIError(
+                f"Speed '{speed}' is not supported by group '{group}' on "
+                f"'{key}'. Supported: {sorted(supported.keys())}.", 400)
+        current = (sub.get("interface_group_speed") or {}).get(group)
+        if current == speed:
+            return {"subsystem": key, "group": group, "speed": speed,
+                    "status": "already_exists"}
+        await self._put_merge(path, {"interface_group_speed": {group: speed}}, depth=2)
+        return {"subsystem": key, "group": group, "speed": speed, "status": "configured"}
+
+    async def read_interface_group(self, group,
+                                   subsystem: Optional[str] = None) -> dict:
+        """Verify one interface group's speed settings (pair with
+        configure_interface_group)."""
+        group = str(group).strip()
+        groups = await self.list_interface_groups(subsystem)
+        matches = [g for g in groups if g["group"] == group]
+        if not matches:
+            return {"group": group, "present": False}
+        return {"present": True, **matches[0]}
+
+    # ─── Domain: route redistribution (into BGP / OSPF) ────────────────────────
+
+    async def configure_bgp_redistribute(self, asn: int, sources: list, *,
+                                         vrf: str = "default",
+                                         address_family: str = "ipv4-unicast") -> dict:
+        """Configure BGP redistribution for one address-family (idempotent,
+        read-modify-write so other AFs/attributes are untouched). `sources`:
+        connected|local-loopback|static|ospf."""
+        asn = _v_asn(asn, "asn")
+        base = f"/system/vrfs/{quote(vrf, safe='')}/bgp_routers/{asn}"
+        existing = await self._read_writable(base)
+        if existing is None:
+            raise ArubaAPIError(f"BGP router {asn} not found in vrf '{vrf}'", 404)
+        redistribute = dict(existing.get("redistribute") or {})
+        redistribute[address_family] = list(sources or [])
+        await self._put_merge(base, {"redistribute": redistribute})
+        return {"asn": asn, "vrf": vrf, "address_family": address_family,
+                "sources": list(sources or []), "status": "updated"}
+
+    async def configure_ospf_redistribute(self, sources: list, *,
+                                          vrf: str = "default",
+                                          instance_tag: int = 1) -> dict:
+        """Configure OSPF redistribution (idempotent). `sources`:
+        connected|local_loopback|static|bgp|rip."""
+        base = f"/system/vrfs/{quote(vrf, safe='')}/ospf_routers/{instance_tag}"
+        existing = await self._read_writable(base)
+        if existing is None:
+            raise ArubaAPIError(
+                f"OSPF router instance {instance_tag} not found in vrf '{vrf}'", 404)
+        await self._put_merge(base, {"redistribute": list(sources or [])})
+        return {"instance_tag": instance_tag, "vrf": vrf,
+                "sources": list(sources or []), "status": "updated"}
 
     # ─── Domain: OSPF (per VRF) ───────────────────────────────────────────────
 
@@ -6399,20 +7716,139 @@ class ArubaOSCXClient:
         base = (f"/system/vrfs/{quote(vrf, safe='')}/ospf_routers/{instance_tag}"
                 f"/areas/{quote(str(area_id), safe='')}/ospf_interfaces")
         key = quote(interface, safe="")
-        config: dict[str, Any] = {
-            "port": self._uri(f"/system/interfaces/{quote(interface, safe='')}")}
-        if extra:
-            config.update({k: v for k, v in extra.items() if v is not None})
+        port_uri = self._uri(f"/system/interfaces/{quote(interface, safe='')}")
+        extras = {k: v for k, v in (extra or {}).items() if v is not None}
         existing = await self._read_writable(f"{base}/{key}")
-        if existing is not None:
-            self._deep_merge(existing, config)
-            await self._put(f"{base}/{key}", existing)
-            action = "updated"
+        action = "created"
+        if existing is not None and existing.get("port"):
+            if extras:
+                self._deep_merge(existing, extras)
+                await self._put(f"{base}/{key}", existing)
+                action = "updated"
+            else:
+                action = "already_exists"
         else:
-            await self._post(base, {"interface_name": interface, **config})
-            action = "created"
+            if existing is not None:
+                # Row without a Port binding: ospfd never picked the interface
+                # up (State Down / Cost 0). Re-create it so the binding is part
+                # of the row creation instead of a later update.
+                await self._delete(f"{base}/{key}")
+                action = "rebound"
+            await self._create_ospf_interface_row(base, key, interface, port_uri, extras)
+        bound = None
+        for attempt in range(4):  # the row can lag behind the POST on stacked/VSF members
+            bound = await self._read_writable(f"{base}/{key}")
+            if bound and bound.get("port"):
+                break
+            await asyncio.sleep(0.5)
+        if not bound or not bound.get("port"):
+            raise ArubaAPIError(
+                f"OSPF interface '{interface}' was written but its port binding is "
+                f"empty on {self.host} (OSPF would stay Down / Cost 0).", 500)
         return {"interface": interface, "area_id": area_id, "vrf": vrf,
                 "status": action}
+
+    async def _create_ospf_interface_row(self, base: str, key: str, interface: str,
+                                         port_uri: str, extras: dict) -> None:
+        """POST an OSPF_Interface WITH its Port binding in the same write (a
+        late `port` update is not picked up by ospfd — the interface stays
+        State Down / Cost 0). Tries the map form the API itself returns, then
+        the plain URI form, and only as a last resort the split POST + PUT."""
+        last: Optional[ArubaAPIError] = None
+        for port_value in ({interface: port_uri}, port_uri):
+            try:
+                await self._post(base, {"interface_name": interface,
+                                        "port": port_value, **extras})
+                return
+            except ArubaAPIError as exc:
+                if exc.status_code not in (400, 500):
+                    raise
+                last = exc
+                try:  # a half-created row would make the next POST a 409
+                    await self._delete(f"{base}/{key}")
+                except ArubaAPIError:
+                    pass
+        logger.warning("OSPF bundled POST rejected on %s (%s); using split write",
+                       self.host, last)
+        await self._post(base, {"interface_name": interface})
+        for attempt in range(4):  # right after the POST the row may still 404
+            try:
+                await self._put_merge(f"{base}/{key}",
+                                      {"port": {interface: port_uri}, **extras})
+                return
+            except ArubaAPIError as exc:
+                if exc.status_code != 404 or attempt == 3:
+                    raise
+                await asyncio.sleep(0.5)
+
+    async def configure_ospf_interface_options(self, interface: str, *,
+                                               network_type: Optional[str] = None,
+                                               cost: Optional[int] = None,
+                                               bfd: Optional[str] = None) -> dict:
+        """Set per-interface OSPFv2 options that live on the PORT object itself
+        (NOT on the OSPF_Interface area-membership object): `network_type`
+        (point_to_point|broadcast|nbma|point_to_multipoint|loopback, or a raw
+        'ospf_iftype_*' value), `cost` (1-65535, output cost override), `bfd`
+        (enable|disable|default, per-interface BFD override). Idempotent
+        read-modify-write; no-ops when none of the three are given."""
+        changes: dict[str, Any] = {}
+        if network_type is not None:
+            changes["ospf_if_type"] = _OSPF_NETWORK_TYPE_MAP.get(
+                str(network_type).lower(), network_type)
+        if cost is not None:
+            changes["ospf_if_out_cost"] = _v_int_range(cost, 1, 65535, "cost")
+        if bfd is not None:
+            if bfd not in _OSPF_BFD_VALUES:
+                raise ArubaAPIError(
+                    f"Invalid bfd '{bfd}'. Expected one of {_OSPF_BFD_VALUES}.", 400)
+            changes["ospf_bfd"] = bfd
+        if not changes:
+            return {"interface": interface, "status": "noop"}
+        await self._put_merge(f"/system/interfaces/{quote(interface, safe='')}", changes)
+        return {"interface": interface, **changes, "status": "updated"}
+
+    async def set_ospf_interface_passive(self, interface: str, passive: bool, *,
+                                        vrf: str = "default",
+                                        instance_tag: int = 1) -> dict:
+        """Mark a single interface passive/active for OSPF (idempotent) by
+        adding/removing its Port reference from the OSPF_Router's
+        `passive_interfaces` map — this is a ROUTER-level list, not a
+        per-area/per-OSPF_Interface field."""
+        base = f"/system/vrfs/{quote(vrf, safe='')}/ospf_routers/{instance_tag}"
+        existing = await self._read_writable(base)
+        if existing is None:
+            raise ArubaAPIError(
+                f"OSPF router instance {instance_tag} not found in vrf '{vrf}'", 404)
+        passive_ifaces = dict(existing.get("passive_interfaces") or {})
+        if passive:
+            passive_ifaces[interface] = self._uri(
+                f"/system/interfaces/{quote(interface, safe='')}")
+        else:
+            passive_ifaces.pop(interface, None)
+        # Full REPLACE of passive_interfaces (not _put_merge/_deep_merge): a
+        # recursive dict-merge only adds/overwrites keys, it never removes
+        # one, so popping an interface out on removal would otherwise
+        # silently survive the merge and stay marked passive.
+        existing["passive_interfaces"] = passive_ifaces
+        await self._put(base, existing)
+        return {"interface": interface, "vrf": vrf, "passive": bool(passive),
+                "status": "updated"}
+
+    async def remove_ospf_interface(self, interface: str, area_id: str, *,
+                                    vrf: str = "default", instance_tag: int = 1) -> dict:
+        """Detach an interface from an OSPF area (idempotent, absent-safe)."""
+        path = (f"/system/vrfs/{quote(vrf, safe='')}/ospf_routers/{instance_tag}"
+                f"/areas/{quote(str(area_id), safe='')}/ospf_interfaces/"
+                f"{quote(interface, safe='')}")
+        try:
+            await self._delete(path)
+            return {"interface": interface, "area_id": area_id, "vrf": vrf,
+                    "status": "deleted"}
+        except ArubaAPIError as exc:
+            if exc.status_code == 404:
+                return {"interface": interface, "area_id": area_id, "vrf": vrf,
+                        "status": "absent"}
+            raise
 
     # ─── Domain: BGP (per VRF, peer-groups, RR clients, EVPN) ─────────────────
 
@@ -6483,12 +7919,20 @@ class ArubaOSCXClient:
                 _v_ip_host(neighbor, "neighbor")
         base = f"/system/vrfs/{quote(vrf, safe='')}/bgp_routers/{asn}/bgp_neighbors"
         key = quote(neighbor, safe="")
+        # `update_source` is an IP field: an interface name ('loopback0' /
+        # 'loopback 0') belongs in local_interface (CLI 'update-source loopback 0').
+        if update_source is not None and not re.match(r"^[0-9A-Fa-f.:]+$", str(update_source)):
+            if local_interface is None:
+                local_interface = re.sub(r"\s+", "", str(update_source))
+            update_source = None
+        if local_interface is not None:
+            local_interface = re.sub(r"\s+", "", str(local_interface))
         config: dict[str, Any] = {"is_peer_group": bool(is_peer_group)}
         if remote_as is not None:
             config["remote_as"] = int(remote_as)
         if peer_group is not None:
-            config["bgp_peer_group"] = self._uri(
-                f"{base}/{quote(peer_group, safe='')}")
+            config["bgp_peer_group"] = {peer_group: self._uri(
+                f"{base}/{quote(peer_group, safe='')}")}
         if update_source is not None:
             config["update_source"] = update_source
         if local_interface is not None:
@@ -6499,7 +7943,8 @@ class ArubaOSCXClient:
         if route_reflector_client is not None:
             config["route_reflector_client"] = route_reflector_client
         if send_community is not None:
-            config["send_community"] = send_community
+            config["send_community"] = self._norm_send_community(
+                send_community, activate)
         if next_hop_unchanged is not None:
             config["next_hop_unchanged"] = next_hop_unchanged
         if description is not None:
@@ -6522,10 +7967,115 @@ class ArubaOSCXClient:
             await self._put(f"{base}/{key}", existing)
             action = "updated"
         else:
+            # Explicit no-shutdown: a REST-created session must not rely on the
+            # column default (observed Idle / Cease-Administrative Shutdown).
+            config.setdefault("shutdown", False)
             await self._post(base, {"ip_or_ifname_or_group_name": neighbor, **config})
             action = "created"
-        return {"neighbor": neighbor, "asn": asn, "vrf": vrf, "status": action,
-                "is_peer_group": bool(is_peer_group)}
+        result = {"neighbor": neighbor, "asn": asn, "vrf": vrf, "status": action,
+                  "is_peer_group": bool(is_peer_group)}
+        # The REST layer can accept a body and silently drop fields.
+        expected = {k: config[k] for k in (
+            "remote_as", "update_source", "activate", "route_reflector_client",
+            "send_community", "next_hop_unchanged", "shutdown") if k in config}
+        got = await self._read_writable(f"{base}/{key}") or {}
+        missing = self._subset_mismatches(expected, got)
+        if missing:
+            result["status"] = "partial"
+            result["not_applied"] = missing
+            result["warning"] = (
+                f"BGP neighbor '{neighbor}' was written but the device did not keep: "
+                f"{missing}. The session will stay Idle until these are set.")
+        return result
+
+    @staticmethod
+    def _norm_send_community(value, activate: Optional[dict] = None) -> dict:
+        """Address-family keyed send-community map. A bare string/list applies to
+        the activated AFs (default l2vpn-evpn). 'both' is rejected by the device
+        for l2vpn-evpn ("invalid internal type value is both"): EVPN only carries
+        extended communities, so it is mapped to 'extended'."""
+        afs = [af for af, on in (activate or {}).items() if on] or ["l2vpn-evpn"]
+        if isinstance(value, str):
+            value = {af: value for af in afs}
+        elif isinstance(value, (list, tuple)):
+            value = {af: "extended" for af in value}
+        out = {}
+        for af, comm in dict(value).items():
+            out[af] = "extended" if (af == "l2vpn-evpn" and comm == "both") else comm
+        return out
+
+    @classmethod
+    def _subset_mismatches(cls, expected: dict, actual: dict, prefix: str = "") -> list:
+        """Dotted keys of `expected` whose value is absent/different in `actual`."""
+        bad = []
+        for k, v in expected.items():
+            got = actual.get(k) if isinstance(actual, dict) else None
+            if isinstance(v, dict):
+                bad.extend(cls._subset_mismatches(
+                    v, got if isinstance(got, dict) else {}, f"{prefix}{k}."))
+            elif isinstance(v, list) and isinstance(got, list):
+                if sorted(map(str, v)) != sorted(map(str, got)):
+                    bad.append(f"{prefix}{k}")
+            elif got != v and not (v is False and got is None):
+                bad.append(f"{prefix}{k}")
+        return bad
+
+    async def wait_bgp_established(self, peers: list, *, vrf: str = "default",
+                                   timeout: float = 60, interval: float = 5) -> dict:
+        """Poll until every peer in `peers` (IP neighbors, not peer-groups) is
+        Established or `timeout` elapses. Returns the per-peer state and, for
+        the ones still down, the last BGP error received/sent."""
+        peers = [str(p) for p in peers or []]
+        deadline = time.monotonic() + max(0, float(timeout))
+        states: dict = {}
+        while True:
+            try:
+                data = await self.get_bgp_neighbors(vrf=vrf)
+            except ArubaAPIError as exc:
+                return {"vrf": vrf, "established": [], "not_established": {
+                    p: {"state": "unknown", "error": str(exc)} for p in peers}}
+            by_ip = {n["peer_ip"]: n for n in data.get("bgp_neighbors") or []}
+            states = {p: by_ip.get(p) for p in peers}
+            pending = [p for p, n in states.items()
+                       if not n or str(n.get("state", "")).lower() != "established"]
+            if not pending or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(interval)
+        not_est = {}
+        for p in pending:
+            n = states.get(p) or {}
+            not_est[p] = {"state": n.get("state", "absent"),
+                          "last_error_received": n.get("last_error_received"),
+                          "last_error_sent": n.get("last_error_sent")}
+        return {"vrf": vrf, "established": [p for p in peers if p not in not_est],
+                "not_established": not_est, "waited_s": round(float(timeout), 1)}
+
+    async def detect_bgp_asn(self, vrf: str = "default") -> Optional[int]:
+        """Local ASN of the BGP router in `vrf` (None if BGP is not configured)."""
+        try:
+            data = await self._get(f"/system/vrfs/{quote(vrf, safe='')}/bgp_routers",
+                                   params={"depth": "1"})
+        except ArubaAPIError:
+            return None
+        for asn, _ in self._collection_items(data or {}):
+            try:
+                return int(asn)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def ensure_bgp_vrf(self, asn: int, vrf: str, *,
+                             redistribute: Optional[list] = None,
+                             router_id: Optional[str] = None) -> dict:
+        """`router bgp <asn>` / `vrf <vrf>` / `address-family ipv4 unicast`
+        (+ redistribute connected/static...) — the BGP VRF context an L3VNI
+        needs to originate EVPN type-5 routes."""
+        out = {"router": await self.ensure_bgp_router(asn, vrf=vrf, router_id=router_id)}
+        if redistribute:
+            out["redistribute"] = await self.configure_bgp_redistribute(
+                asn, list(redistribute), vrf=vrf, address_family="ipv4-unicast")
+        out["status"] = out["router"]["status"]
+        return out
 
     async def delete_bgp_neighbor(self, neighbor: str, asn: int,
                                   vrf: str = "default") -> dict:
@@ -6545,9 +8095,14 @@ class ArubaOSCXClient:
                               dyn_vxlan_tunnel_bridging_mode: Optional[str] = None,
                               arp_suppression_enable: Optional[bool] = None,
                               nd_suppression_enable: Optional[bool] = None,
+                              redistribute_local_mac: Optional[bool] = None,
+                              redistribute_local_svi: Optional[bool] = None,
                               extra: Optional[dict] = None) -> dict:
         """Create/update the global EVPN config. `dyn_vxlan_tunnel_bridging_mode`
-        (no-bridging | ibgp-ebgp) drives the Scaled Design inter-VxLAN bridging."""
+        (no-bridging | ibgp-ebgp) drives the Scaled Design inter-VxLAN bridging.
+        `redistribute_local_mac` / `redistribute_local_svi` = CLI `redistribute
+        local-mac` / `redistribute local-svi` (Type-2 advertisement of the local
+        system MAC / of the SVI IP+MAC); only the keys given are touched."""
         config: dict[str, Any] = {}
         if dyn_vxlan_tunnel_bridging_mode is not None:
             config["dyn_vxlan_tunnel_bridging_mode"] = dyn_vxlan_tunnel_bridging_mode
@@ -6557,6 +8112,17 @@ class ArubaOSCXClient:
             config["nd_suppression_enable"] = bool(nd_suppression_enable)
         if extra:
             config.update({k: v for k, v in extra.items() if v is not None})
+        redistribute = dict(config.get("redistribute") or {})
+        if redistribute_local_mac is not None:
+            redistribute["local-mac"] = bool(redistribute_local_mac)
+        if redistribute_local_svi is not None:
+            redistribute["local-svi"] = bool(redistribute_local_svi)
+        if redistribute:
+            bad = set(redistribute) - {"local-mac", "local-svi"}
+            if bad:
+                raise ArubaAPIError(
+                    f"Invalid redistribute key(s) {sorted(bad)}: use 'local-mac' / 'local-svi'.", 400)
+            config["redistribute"] = redistribute
         if not config:
             return {"status": "noop"}
         exists = False
@@ -6567,12 +8133,19 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put("/system/evpn", config)
+            await self._put_merge("/system/evpn", config)
             action = "updated"
         else:
             await self._post("/system/evpn", config)
             action = "created"
-        return {"status": action, "config": config}
+        result = {"status": action, "config": config}
+        got = await self._read_writable("/system/evpn") or {}
+        missing = self._subset_mismatches(config, got)
+        if missing:
+            result["status"] = "partial"
+            result["not_applied"] = missing
+            result["warning"] = f"EVPN global written but not kept by the device: {missing}"
+        return result
 
     async def create_l3vni(self, vni: int, vrf: str,
                            vxlan_interface: str = "vxlan1") -> dict:
@@ -6592,7 +8165,16 @@ class ArubaOSCXClient:
                 f"/system/interfaces/{quote(vxlan_interface, safe='')}")},
             "vrf": {vrf: self._uri(f"/system/vrfs/{quote(vrf, safe='')}")},
         }
-        await self._post("/system/virtual_network_ids", body)
+        try:
+            await self._post("/system/virtual_network_ids", body)
+        except ArubaAPIError as exc:
+            if exc.status_code == 400 and "not configurable" in str(exc):
+                raise ArubaAPIError(
+                    f"L3VNI {vni} cannot be created over REST on {self.host} "
+                    f"(API {self.api_version}: `routing`/`vrf` are not configurable on "
+                    "a VNI in this schema \u2014 e.g. 10.16 / 6200, no L3VNI support). "
+                    "Use L2VNIs only on this device.", 400) from exc
+            raise
         return {"vni": vni, "vrf": vrf, "routing": True, "created": True,
                 "status": "created"}
 
@@ -6673,8 +8255,8 @@ class ArubaOSCXClient:
             config.update({k: v for k, v in extra.items() if v is not None})
         if await self.port_access_role_exists(name):
             if config:
-                await self._put(f"/system/port_access_roles/{quote(name, safe='')}",
-                                config)
+                await self._put_merge(f"/system/port_access_roles/{quote(name, safe='')}",
+                                      config)
             return {"role": name, "status": "updated" if config else "already_exists",
                     "config": config}
         await self._post("/system/port_access_roles", {"name": name, **config})
@@ -6740,7 +8322,7 @@ class ArubaOSCXClient:
             body.update({k: v for k, v in extra.items() if v is not None})
         if not body:
             return {"interface": interface, "status": "noop", "applied": {}}
-        await self._put(f"/system/interfaces/{encoded}", body)
+        await self._put_merge(f"/system/interfaces/{encoded}", body)
         return {"interface": interface, "status": "configured",
                 "applied": body, "roles": applied_roles}
 
@@ -6757,7 +8339,7 @@ class ArubaOSCXClient:
                 "aaa_auth_precedence", "aaa_auth_priority"]
         body = {f: [] for f in fields}
         try:
-            await self._put(f"/system/interfaces/{encoded}", body)
+            await self._put_merge(f"/system/interfaces/{encoded}", body)
             return {"interface": interface, "status": "cleared", "fields": fields}
         except ArubaAPIError as exc:
             if exc.status_code == 404:
@@ -6790,7 +8372,7 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put(f"{base}/{method_key}", config)
+            await self._put_merge(f"{base}/{method_key}", config)
             action = "updated"
         else:
             await self._post(base, {"authentication_method": method, **config})
@@ -6842,7 +8424,7 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put("/system/app_recognition", config)
+            await self._put_merge("/system/app_recognition", config)
             action = "updated"
         else:
             await self._post("/system/app_recognition", config)
@@ -6863,8 +8445,133 @@ class ArubaOSCXClient:
         cur = (current or {}).get("virtual_mac") if isinstance(current, dict) else None
         if cur == mac:
             return {"virtual_mac": mac, "status": "already_exists"}
+        # /system is the one resource where a targeted PUT is kept on purpose:
+        # its writable view is very large and was validated live to leave
+        # sibling attributes intact (hostname, timezone, ...).
         await self._put("/system", {"virtual_mac": mac})
         return {"virtual_mac": mac, "previous": cur or None, "status": "configured"}
+
+    _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_.]{0,63}$")
+
+    async def set_hostname(self, hostname: str) -> dict:
+        """Set the device hostname (System.hostname). Idempotent."""
+        hostname = (hostname or "").strip()
+        if not self._HOSTNAME_RE.match(hostname):
+            raise ArubaAPIError(
+                f"Invalid hostname '{hostname}': 1-64 chars, letters/digits/'-'/'_'/'.', "
+                "must start with a letter or digit.", 400)
+        current = await self._get(
+            "/system", params={"depth": "1", "selector": "configuration",
+                                "attributes": "hostname"})
+        cur = (current or {}).get("hostname") if isinstance(current, dict) else None
+        if cur == hostname:
+            return {"hostname": hostname, "status": "already_exists"}
+        # Same documented targeted-PUT exception as set_virtual_mac (/system).
+        await self._put("/system", {"hostname": hostname})
+        return {"hostname": hostname, "previous": cur or None, "status": "configured"}
+
+    async def read_hostname(self) -> dict:
+        current = await self._get(
+            "/system", params={"depth": "1", "selector": "configuration",
+                                "attributes": "hostname"})
+        hn = (current or {}).get("hostname") if isinstance(current, dict) else None
+        return {"present": bool(hn), "hostname": hn}
+
+    # ─── Domain: global port-access AAA (dot1x / mac-auth / RADIUS CoA) ───────
+
+    _MAC_AUTH_FORMATS = ("no-delimiter", "single-dash", "multi-dash", "multi-colon",
+                         "no-delimiter-uppercase", "single-dash-uppercase",
+                         "multi-dash-uppercase", "multi-colon-uppercase")
+
+    async def _read_system_attrs(self, attrs: str, depth: int = 2) -> dict:
+        data = await self._get("/system", params={
+            "depth": str(depth), "selector": "configuration", "attributes": attrs})
+        return data if isinstance(data, dict) else {}
+
+    async def set_port_access_global(self, *, dot1x_enable: Optional[bool] = None,
+                                     dot1x_server_group: Optional[str] = None,
+                                     mac_auth_enable: Optional[bool] = None,
+                                     mac_auth_server_group: Optional[str] = None,
+                                     mac_auth_password: Optional[str] = None,
+                                     mac_auth_address_format: Optional[str] = None,
+                                     accounting_server_group: Optional[str] = None,
+                                     coa_enable: Optional[bool] = None,
+                                     coa_udp_port: Optional[int] = None,
+                                     extra_aaa: Optional[dict] = None) -> dict:
+        """Global `aaa authentication port-access dot1x|mac-auth authenticator
+        enable` (+ RADIUS server-group per method, accounting group) and
+        `radius dyn-authorization enable` (CoA). Read-modify-write on the two
+        /system sub-objects only (targeted PUT, siblings untouched)."""
+        if mac_auth_address_format is not None and \
+                mac_auth_address_format not in self._MAC_AUTH_FORMATS:
+            raise ArubaAPIError(
+                f"Invalid mac_auth_address_format '{mac_auth_address_format}'. "
+                f"Valid: {self._MAC_AUTH_FORMATS}", 400)
+        if coa_udp_port is not None:
+            coa_udp_port = _v_int_range(coa_udp_port, 1024, 49151, "coa_udp_port")
+        current = await self._read_system_attrs("aaa,radius_dynamic_authorization")
+        aaa = dict(current.get("aaa") or {})
+        rda = dict(current.get("radius_dynamic_authorization") or {})
+        aaa_changes: dict[str, Any] = {}
+        if dot1x_enable is not None:
+            aaa_changes["dot1x_auth_enable"] = bool(dot1x_enable)
+        if dot1x_server_group is not None:
+            aaa_changes["dot1x_radius_server_group"] = dot1x_server_group
+        if mac_auth_enable is not None:
+            aaa_changes["mac_auth_enable"] = bool(mac_auth_enable)
+        if mac_auth_server_group is not None:
+            aaa_changes["mac_auth_radius_server_group"] = mac_auth_server_group
+        if mac_auth_password is not None:
+            aaa_changes["mac_auth_password"] = mac_auth_password
+        if mac_auth_address_format is not None:
+            aaa_changes["mac_auth_address_format"] = mac_auth_address_format
+        if accounting_server_group is not None:
+            aaa_changes["portaccess_accounting_radius_server_group"] = accounting_server_group
+        if extra_aaa:
+            aaa_changes.update({k: v for k, v in extra_aaa.items() if v is not None})
+        rda_changes: dict[str, Any] = {}
+        if coa_enable is not None:
+            rda_changes["enable"] = bool(coa_enable)
+        if coa_udp_port is not None:
+            rda_changes["udp_port"] = coa_udp_port
+        if not aaa_changes and not rda_changes:
+            return {"status": "noop"}
+        body: dict[str, Any] = {}
+        if aaa_changes:
+            body["aaa"] = self._deep_merge(aaa, aaa_changes)
+        if rda_changes:
+            body["radius_dynamic_authorization"] = self._deep_merge(rda, rda_changes)
+        # /system targeted PUT (same documented exception as set_virtual_mac).
+        await self._put("/system", body)
+        return {"status": "configured", "aaa": aaa_changes,
+                "radius_dynamic_authorization": rda_changes}
+
+    async def read_port_access_global(self) -> dict:
+        current = await self._read_system_attrs("aaa,radius_dynamic_authorization")
+        aaa = current.get("aaa") or {}
+        rda = current.get("radius_dynamic_authorization") or {}
+        return {"present": True,
+                "dot1x_enable": aaa.get("dot1x_auth_enable"),
+                "dot1x_server_group": aaa.get("dot1x_radius_server_group"),
+                "mac_auth_enable": aaa.get("mac_auth_enable"),
+                "mac_auth_server_group": aaa.get("mac_auth_radius_server_group"),
+                "mac_auth_address_format": aaa.get("mac_auth_address_format"),
+                "accounting_server_group": aaa.get("portaccess_accounting_radius_server_group"),
+                "coa_enable": rda.get("enable"), "coa_udp_port": rda.get("udp_port")}
+
+    async def list_radius_servers(self, vrf: str = "mgmt") -> list:
+        raw = await self._get_config(f"/system/vrfs/{quote(vrf, safe='')}/radius_servers",
+                                     depth=2)
+        out = []
+        if isinstance(raw, dict):
+            for key, s in raw.items():
+                if isinstance(s, dict):
+                    out.append({"address": s.get("address") or key.split(",")[0],
+                                "port": s.get("port"), "vrf": vrf,
+                                "server_groups": [self._ref_name(g) for g in
+                                                  (s.get("server_group") or {})],
+                                "tracking_enable": s.get("tracking_enable")})
+        return out
 
     # ─── Domain: AAA (RADIUS / TACACS+ / server-groups / global authn+acct) ───
 
@@ -6872,7 +8579,7 @@ class ArubaOSCXClient:
         """PUT `body` to a (possibly singleton) resource, falling back to POST
         when the resource does not exist yet (404). Returns 'updated'/'created'."""
         try:
-            await self._put(path, body)
+            await self._put_merge(path, body)
             return "updated"
         except ArubaAPIError as exc:
             if exc.status_code == 404:
@@ -6977,7 +8684,7 @@ class ArubaOSCXClient:
                 raise
         if exists:
             if config:
-                await self._put(f"{base}/{key}", config)
+                await self._put_merge(f"{base}/{key}", config)
             return {"radius_server": address, "vrf": vrf, "port": port,
                     "status": "updated" if config else "already_exists"}
         await self._post(base, {"address": address, "port": port,
@@ -7044,7 +8751,7 @@ class ArubaOSCXClient:
             if group is not None:
                 body["group"] = group_uris
             if body:
-                await self._put(f"{base}/{key}", body)
+                await self._put_merge(f"{base}/{key}", body)
             return {"tacacs_server": address, "vrf": vrf, "tcp_port": tcp_port,
                     "status": "updated" if body else "already_exists"}
         await self._post(base, {"address": address, "tcp_port": tcp_port,
@@ -7106,7 +8813,7 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put(f"/system/aaa_server_group_prios/{key}", body)
+            await self._put_merge(f"/system/aaa_server_group_prios/{key}", body)
             action = "updated"
         else:
             await self._post("/system/aaa_server_group_prios",
@@ -7129,8 +8836,8 @@ class ArubaOSCXClient:
             if exc.status_code != 404:
                 raise
         if exists:
-            await self._put(f"/system/gbp_role_name_id_maps/{key}",
-                            {"gbp_role_id": role_id})
+            await self._put_merge(f"/system/gbp_role_name_id_maps/{key}",
+                                  {"gbp_role_id": role_id})
             return {"gbp_role": role_name, "role_id": role_id, "status": "updated"}
         await self._post("/system/gbp_role_name_id_maps",
                          {"gbp_role_name": role_name, "gbp_role_id": role_id})
@@ -7185,7 +8892,7 @@ class ArubaOSCXClient:
                 raise
         if exists:
             if entry:
-                await self._put(f"{base}/{seq}", entry)
+                await self._put_merge(f"{base}/{seq}", entry)
             action = "updated"
         else:
             await self._post(base, {"sequence_number": seq, **entry})
@@ -7250,7 +8957,7 @@ class ArubaOSCXClient:
                 raise
         if exists:
             if entry:
-                await self._put(f"{base}/{seq}", entry)
+                await self._put_merge(f"{base}/{seq}", entry)
             action = "updated"
         else:
             await self._post(base, {"sequence_number": seq, **entry})
@@ -7363,7 +9070,9 @@ class ArubaOSCXClient:
         return {"present": True,
                 "dyn_vxlan_tunnel_bridging_mode": data.get("dyn_vxlan_tunnel_bridging_mode"),
                 "arp_suppression_enable": data.get("arp_suppression_enable"),
-                "nd_suppression_enable": data.get("nd_suppression_enable")}
+                "nd_suppression_enable": data.get("nd_suppression_enable"),
+                "redistribute_local_mac": (data.get("redistribute") or {}).get("local-mac", False),
+                "redistribute_local_svi": (data.get("redistribute") or {}).get("local-svi", False)}
 
     async def read_vrf(self, name: str) -> dict:
         """Verify a VRF (RD/RT + per-AF route-targets)."""
@@ -7380,11 +9089,116 @@ class ArubaOSCXClient:
                 afs[af.get("address_family") or key] = {
                     "import_route_targets": af.get("import_route_targets"),
                     "export_route_targets": af.get("export_route_targets")}
+        l3vni = None
+        vnis = await self._get_config("/system/virtual_network_ids", depth=2)
+        if isinstance(vnis, dict):
+            for _key, cfg in self._collection_items(vnis):
+                if (isinstance(cfg, dict) and cfg.get("routing")
+                        and self._ref_name(cfg.get("vrf")) == name):
+                    l3vni = cfg.get("id")
+                    break
         return {"vrf": name, "present": True, "type": data.get("type"),
-                "rd": data.get("rd"),
+                "rd": data.get("rd"), "l3vni": l3vni,
                 "evpn_import_route_targets": data.get("evpn_import_route_targets"),
                 "evpn_export_route_targets": data.get("evpn_export_route_targets"),
                 "address_families": afs}
+
+    async def read_svi(self, vlan_id: int) -> dict:
+        """Verify an SVI (interface vlan<id>): VRF, IP, active-gateway."""
+        name = f"vlan{vlan_id}"
+        data = await self._get_config(f"/system/interfaces/{name}")
+        if data is None:
+            return {"vlan": vlan_id, "interface": name, "present": False}
+        return {"vlan": vlan_id, "interface": name, "present": True,
+                "vrf": self._ref_name(data.get("vrf")) or "default",
+                "ip4_address": data.get("ip4_address"),
+                "active_gateway_ip": (data.get("vsx_virtual_ip4") or [None])[0],
+                "active_gateway_mac": data.get("vsx_virtual_gw_mac_v4"),
+                "admin": (data.get("user_config") or {}).get("admin")}
+
+    async def read_trunk(self, interface: str) -> dict:
+        """Verify the tagged-VLAN set (vlan_trunks) of a trunk interface."""
+        data = await self._get_config(f"/system/interfaces/{quote(interface, safe='')}")
+        if data is None:
+            return {"interface": interface, "present": False, "tagged_vlans": []}
+        trunks = data.get("vlan_trunks") or {}
+        return {"interface": interface, "present": True,
+                "vlan_mode": data.get("vlan_mode"),
+                "native_vlan": self._ref_name(data.get("vlan_tag")),
+                "tagged_vlans": sorted(int(v) for v in trunks if str(v).isdigit())}
+
+    async def read_vlan(self, vlan_id: int) -> dict:
+        """Verify a VLAN definition."""
+        data = await self._get_config(f"/system/vlans/{vlan_id}")
+        if data is None:
+            return {"vlan": vlan_id, "present": False}
+        return {"vlan": vlan_id, "present": True, "name": data.get("name"),
+                "description": data.get("description"), "admin": data.get("admin")}
+
+    async def read_interface_admin(self, name: str) -> dict:
+        """Verify the admin state of a plain interface."""
+        data = await self._get_config(f"/system/interfaces/{quote(name, safe='')}")
+        if data is None:
+            return {"interface": name, "present": False}
+        return {"interface": name, "present": True,
+                "admin": (data.get("user_config") or {}).get("admin"),
+                "routing": data.get("routing")}
+
+    async def read_static_route(self, prefix: str, vrf: str = "default") -> dict:
+        """Verify a static route and its nexthops."""
+        key = quote(prefix, safe="")
+        base = f"/system/vrfs/{quote(vrf, safe='')}/static_routes/{key}"
+        data = await self._get_config(base)
+        if data is None:
+            return {"prefix": prefix, "vrf": vrf, "present": False, "nexthops": []}
+        nexthops = []
+        raw = await self._get_config(f"{base}/static_nexthops", depth=2)
+        if isinstance(raw, dict):
+            for nh_id, nh in raw.items():
+                if not isinstance(nh, dict):
+                    continue
+                nexthops.append({
+                    "id": nh_id, "ip_address": nh.get("ip_address"),
+                    "type": nh.get("type"), "distance": nh.get("distance"),
+                    "tag": nh.get("tag"), "bfd_enable": nh.get("bfd_enable"),
+                    "port": self._ref_name(nh.get("port"))})
+        return {"prefix": prefix, "vrf": vrf, "present": True,
+                "name": data.get("name"), "address_family": data.get("address_family"),
+                "nexthops": sorted(nexthops, key=lambda n: str(n["id"]))}
+
+    async def read_bgp_redistribute(self, asn: int, vrf: str = "default") -> dict:
+        """Verify BGP redistribution config (per address-family)."""
+        data = await self._get_config(f"/system/vrfs/{quote(vrf, safe='')}/bgp_routers/{asn}",
+                                      depth=1)
+        if data is None:
+            return {"asn": asn, "vrf": vrf, "present": False, "redistribute": {}}
+        return {"asn": asn, "vrf": vrf, "present": True,
+                "redistribute": data.get("redistribute") or {}}
+
+    async def read_ospf_redistribute(self, instance_tag: int = 1,
+                                     vrf: str = "default") -> dict:
+        """Verify OSPF redistribution config."""
+        data = await self._get_config(
+            f"/system/vrfs/{quote(vrf, safe='')}/ospf_routers/{instance_tag}", depth=1)
+        if data is None:
+            return {"instance_tag": instance_tag, "vrf": vrf, "present": False,
+                    "redistribute": []}
+        return {"instance_tag": instance_tag, "vrf": vrf, "present": True,
+                "redistribute": data.get("redistribute") or []}
+
+    async def read_vsx(self) -> dict:
+        """Verify the VSX pairing configuration (role, ISL/keepalive ports,
+        system-mac). Pairs with configure_vsx."""
+        data = await self._get_config("/system/vsx", depth=1)
+        if data is None:
+            return {"present": False}
+        return {"present": True, "device_role": data.get("device_role"),
+                "isl_port": self._ref_name(data.get("isl_port")),
+                "keepalive_port": self._ref_name(data.get("keepalive_port")),
+                "keepalive_vrf": self._ref_name(data.get("keepalive_vrf")) or "default",
+                "keepalive_src_ip": data.get("keepalive_src_ip"),
+                "keepalive_peer_ip": data.get("keepalive_peer_ip"),
+                "system_mac": data.get("system_mac")}
 
     async def read_ospf(self, vrf: str = "default", instance_tag: int = 1) -> dict:
         """Verify an OSPF router instance (router-id, areas, attached interfaces)."""
@@ -7517,7 +9331,30 @@ def _format_interface(name: str, data: dict) -> dict:
             vrf_name = vrf_raw.rstrip("/").split("/")[-1]
         else:
             vrf_name = "default"
-        return {
+        # B4: L1 state/down-reason (Port.l1_state{ready,l1_state_down_reason},
+        # Port.l1_state_aggregate for split/LAG-aware ports) — already present
+        # in a plain GET at depth>=1 (no selector needed, they're status
+        # fields), just never surfaced before. Only expose the down-reason
+        # when L1 isn't actually ready — the field can hold a stale
+        # 'uninitialized'-like value even once the port is up.
+        l1 = data.get("l1_state") if isinstance(data.get("l1_state"), dict) else {}
+        l1_agg = data.get("l1_state_aggregate") if isinstance(data.get("l1_state_aggregate"), dict) else {}
+        l1_ready = l1.get("ready") if isinstance(l1.get("ready"), bool) else None
+        l1_agg_ready = l1_agg.get("ready") if isinstance(l1_agg.get("ready"), bool) else None
+        ip4_list = (list(ip4.keys()) if isinstance(ip4, dict)
+                    else ([ip4] if isinstance(ip4, str) and ip4 else []))
+        ip6_list = (list(ip6.keys()) if isinstance(ip6, dict)
+                    else ([ip6] if isinstance(ip6, str) and ip6 else []))
+        iface_type = data.get("type", "N/A")
+        routing_raw = data.get("routing")
+        # 10.16 (e.g. 6200) reports routing=false on SVIs that DO route: an SVI
+        # (and a loopback) is L3 by definition once it carries an address.
+        routing = routing_raw
+        if iface_type in ("vlan", "loopback") and (ip4_list or ip6_list
+                                                   or data.get("vsx_virtual_ip4")):
+            routing = True
+        has_stats = isinstance(stats, dict) and bool(stats)
+        out = {
             "name": name,
             "description": data.get("description", ""),
             "admin_state": data.get("admin_state", "N/A"),
@@ -7525,20 +9362,45 @@ def _format_interface(name: str, data: dict) -> dict:
             "link_speed": data.get("link_speed", "N/A"),
             "duplex": data.get("duplex", "N/A"),
             "mtu": data.get("mtu", "N/A"),
-            "type": data.get("type", "N/A"),
-            "routing": data.get("routing"),
+            "type": iface_type,
+            "routing": routing,
             "vrf": vrf_name,
-            "ip4_addresses": list(ip4.keys()) if isinstance(ip4, dict) else ([ip4] if isinstance(ip4, str) and ip4 else []),
-            "ip6_addresses": list(ip6.keys()) if isinstance(ip6, dict) else ([ip6] if isinstance(ip6, str) and ip6 else []),
+            "l1_state": l1_ready if l1_ready is not None else "N/A",
+            "l1_state_down_reason": (l1.get("l1_state_down_reason", "N/A")
+                                     if l1_ready is False else None),
+            "l1_state_aggregate": l1_agg_ready if l1_agg_ready is not None else "N/A",
+            "l1_state_aggregate_down_reason": (
+                l1_agg.get("l1_state_aggregate_down_reason", "N/A")
+                if l1_agg_ready is False else None),
+            "ip4_addresses": ip4_list,
+            "ip6_addresses": ip6_list,
             "vlan_mode": data.get("vlan_mode", "N/A"),
             "vlan_tag": vlan_tag_id,
-            "statistics": {
-                "rx_bytes": stats.get("rx_bytes", 0) if isinstance(stats, dict) else 0,
-                "tx_bytes": stats.get("tx_bytes", 0) if isinstance(stats, dict) else 0,
-                "rx_errors": stats.get("rx_crc_err", 0) if isinstance(stats, dict) else 0,
-                "tx_errors": stats.get("tx_errors", 0) if isinstance(stats, dict) else 0,
-            },
+            "statistics": ({
+                "rx_bytes": stats.get("rx_bytes", 0),
+                "tx_bytes": stats.get("tx_bytes", 0),
+                "rx_errors": stats.get("rx_crc_err", 0),
+                "tx_errors": stats.get("tx_errors", 0),
+            } if has_stats else None),
         }
+        if routing != routing_raw:
+            out["routing_configured"] = routing_raw
+        if not has_stats:
+            l3c = data.get("l3_counters_enable")
+            out["statistics_note"] = (
+                "no counters reported by the device for this interface"
+                + (" (L3 counters disabled: 'l3-counters' not enabled)"
+                   if isinstance(l3c, dict) and not any(l3c.values()) else ""))
+        if iface_type == "vlan":
+            out["ip_mtu"] = data.get("ip_mtu")
+            for key in ("vsx_virtual_ip4", "vsx_virtual_ip6"):
+                val = data.get(key)
+                out[key] = list(val) if isinstance(val, (list, tuple)) else (
+                    list(val.keys()) if isinstance(val, dict) else [])
+            out["vsx_virtual_gw_mac_v4"] = data.get("vsx_virtual_gw_mac_v4")
+            out["vsx_virtual_gw_mac_v6"] = data.get("vsx_virtual_gw_mac_v6")
+            out["active_gateway"] = bool(out["vsx_virtual_ip4"] or out["vsx_virtual_ip6"])
+        return out
     except (AttributeError, TypeError) as exc:
         logger.warning("_format_interface(%s) : type inattendu — %s", name, exc)
         return {"name": name}
@@ -7695,6 +9557,9 @@ def _format_lag(name: str, data: dict, by_name: dict) -> dict:
         "lacp_rate": other.get("lacp-time", "N/A"),
         "lacp_fallback": other.get("lacp-fallback"),
         "mclag_enabled": other.get("mclag_enabled"),
+        "evpn_multihoming_esi": data.get("evpn_multihoming_esi"),
+        "evpn_multihoming_es_rd": data.get("evpn_multihoming_es_rd"),
+        "evpn_multihoming_es_import_rt": data.get("evpn_multihoming_es_import_rt"),
         "vlan_mode": data.get("vlan_mode", "N/A"),
         "routing": data.get("routing"),
         "member_count": len(members),
