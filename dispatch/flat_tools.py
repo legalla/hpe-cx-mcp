@@ -247,6 +247,7 @@ _MAP_SYSTEM = {
 _MAP_INTERFACES = {
     "physical": "get_interfaces", "transceivers": "get_transceivers",
     "counters": "get_interface_counters",
+    "unnumbered": "get_unnumbered_interfaces",
     "supported_transceivers": "get_supported_transceivers",
     "poe": "get_poe_status",
     "loopbacks": "get_loopbacks", "routed": "get_routed_ports",

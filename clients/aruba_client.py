@@ -1590,6 +1590,8 @@ class ArubaOSCXClient:
         def has_l3_config(raw: dict) -> bool:
             if raw.get("ip4_address") or raw.get("ip6_address") or raw.get("ip6_addresses"):
                 return True
+            if self._unnumbered_owner(raw):
+                return True
             vrf = raw.get("vrf")
             return bool(vrf) and self._ref_name(vrf) not in (None, "", "default")
 
@@ -6400,6 +6402,8 @@ class ArubaOSCXClient:
                                          remove_from_lag: bool = False,
                                          delete_empty_lag: bool = False,
                                          force_admin_flap: bool = False,
+                                         unnumbered_interface: Optional[str] = None,
+                                         remove_unnumbered: bool = False,
                                          extra: Optional[dict] = None) -> dict:
         """Turn a physical port into a routed (L3) interface (idempotent).
         Used for point-to-point underlay links (no switchport, /31 or /30 IP).
@@ -6431,9 +6435,28 @@ class ArubaOSCXClient:
         or requiring a separate 'no lag' step — the result's
         `removed_from_lag` field names the LAG it was pulled from (None if it
         wasn't a member of one), with a warning that this bounces the LAG's
-        remaining bundle."""
+        remaining bundle.
+
+        `unnumbered_interface` (e.g. 'loopback0'): IP-unnumbered — the port
+        borrows the primary IPv4 address of that owner interface
+        (`unnumbered.ipv4_address_owner_interface`) instead of having its own;
+        mutually exclusive with `ip_cidr`, and any existing own address is
+        dropped. `remove_unnumbered=True` clears the borrowing (the port is
+        left without an IP unless `ip_cidr` is given too)."""
         if ip_cidr is not None:
             ip_cidr = _v_ipv4_cidr(ip_cidr, "ip_cidr")
+        if unnumbered_interface and ip_cidr is not None:
+            raise ValueError("`ip_cidr` and `unnumbered_interface` are mutually "
+                             "exclusive: an unnumbered port borrows the owner's address.")
+        if unnumbered_interface and remove_unnumbered:
+            raise ValueError("`unnumbered_interface` and `remove_unnumbered` are "
+                             "mutually exclusive.")
+        if unnumbered_interface:
+            if unnumbered_interface == name:
+                raise ValueError("an interface cannot be unnumbered on itself.")
+            if not await self.interface_exists(unnumbered_interface):
+                raise ValueError(f"unnumbered owner interface '{unnumbered_interface}' "
+                                 "does not exist on the device.")
         if mtu is not None:
             mtu = _v_mtu(mtu, "mtu")
         removed_from_lag = None
@@ -6456,6 +6479,14 @@ class ArubaOSCXClient:
         }
         if ip_cidr is not None:
             changes["ip4_address"] = ip_cidr
+        if unnumbered_interface:
+            body.pop("ip4_address", None)
+            body["unnumbered"] = None
+            changes["unnumbered"] = {"ipv4_address_owner_interface": {
+                unnumbered_interface: self._uri(
+                    f"/system/interfaces/{quote(unnumbered_interface, safe='')}")}}
+        elif remove_unnumbered:
+            body.pop("unnumbered", None)
         if description is not None:
             changes["description"] = description
         if mtu is not None:
@@ -6502,6 +6533,8 @@ class ArubaOSCXClient:
         result = {"interface": name, "ip4_address": body.get("ip4_address"),
                   "vrf": vrf, "admin": applied_admin, "status": "configured",
                   "removed_from_lag": removed_from_lag}
+        if unnumbered_interface:
+            result["unnumbered_interface"] = unnumbered_interface
         if removed_from_lag:
             result["lag_deleted"] = lag_deleted
         if flapped:
@@ -9021,6 +9054,32 @@ class ArubaOSCXClient:
                 "admin": (data.get("user_config") or {}).get("admin"),
                 "vrf": self._ref_name(data.get("vrf")) or "default"}
 
+    @classmethod
+    def _unnumbered_owner(cls, data: dict) -> Optional[str]:
+        """Owner interface name an IP-unnumbered port borrows its address from."""
+        un = data.get("unnumbered") if isinstance(data, dict) else None
+        if not isinstance(un, dict):
+            return None
+        return cls._ref_name(un.get("ipv4_address_owner_interface"))
+
+    async def get_unnumbered_interfaces(self, interface_name: Optional[str] = None) -> dict:
+        """List IP-unnumbered interfaces and the owner interface each one borrows from."""
+        if interface_name:
+            data = await self._get_config(
+                f"/system/interfaces/{quote(interface_name, safe='')}", depth=2)
+            items = [(interface_name, data)] if data else []
+        else:
+            items = self._collection_items(
+                await self._get("/system/interfaces", params={"depth": "2"}))
+        out = []
+        for n, iface in items:
+            owner = self._unnumbered_owner(iface)
+            if owner:
+                out.append({"interface": n, "owner_interface": owner,
+                            "vrf": self._ref_name(iface.get("vrf")) or "default",
+                            "admin": (iface.get("user_config") or {}).get("admin")})
+        return {"unnumbered_interfaces": out, "count": len(out)}
+
     async def read_routed_interface(self, name: str) -> dict:
         """Verify a routed (L3) port (routing/ip/mtu/vrf)."""
         data = await self._get_config(f"/system/interfaces/{quote(name, safe='')}")
@@ -9028,6 +9087,7 @@ class ArubaOSCXClient:
             return {"interface": name, "present": False}
         return {"interface": name, "present": True, "routing": data.get("routing"),
                 "ip4_address": data.get("ip4_address"), "ip_mtu": data.get("ip_mtu"),
+                "unnumbered_interface": self._unnumbered_owner(data),
                 "description": data.get("description"),
                 "admin": (data.get("user_config") or {}).get("admin"),
                 "vrf": self._ref_name(data.get("vrf")) or "default"}
@@ -9374,6 +9434,7 @@ def _format_interface(name: str, data: dict) -> dict:
                 if l1_agg_ready is False else None),
             "ip4_addresses": ip4_list,
             "ip6_addresses": ip6_list,
+            "unnumbered_interface": ArubaOSCXClient._unnumbered_owner(data),
             "vlan_mode": data.get("vlan_mode", "N/A"),
             "vlan_tag": vlan_tag_id,
             "statistics": ({

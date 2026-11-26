@@ -6,6 +6,13 @@ All notable changes to **hpe-cx-mcp** are documented here. The format follows
 [VERSION](VERSION) and is baked into the image (`CX_VERSION`, OCI label,
 `/healthz`).
 
+## [Unreleased]
+
+### Added
+- IP-unnumbered interfaces: `configure_routed_port(unnumbered_interface=..., remove_unnumbered=...)`
+  (also per entry of `interfaces`), new read tool `get_unnumbered_interfaces`,
+  and `unnumbered_interface` exposed by `verify_routed_port` / `get_interfaces`.
+
 ## [1.7.0] — 2026-10-05
 
 Field feedback from a Campus -> EVPN/VXLAN fabric migration (AOS-CX 10.16-10.18).

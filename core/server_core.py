@@ -1086,6 +1086,7 @@ _SITE_OPERATIONS: dict[str, str] = {
     "get_transceivers": "get_transceivers",
     "get_interfaces": "get_interfaces",
     "get_interface_counters": "get_interface_counters",
+    "get_unnumbered_interfaces": "get_unnumbered_interfaces",
     "get_supported_transceivers": "get_supported_transceivers",
     "get_poe_status": "get_poe_status",
     "get_loopbacks": "get_loopbacks",

@@ -417,6 +417,8 @@ async def configure_routed_port(interface: str = None, device: str = None, site:
                                 internal_vlan_range_size: int = 128,
                                 verify_connected_route: bool = True,
                                 interfaces: list = None,
+                                unnumbered_interface: str = None,
+                                remove_unnumbered: bool = False,
                                 apply: bool = False) -> dict:
     """Configure a physical port as a routed (L3) interface (idempotent): no
     switchport, IP address, optional VRF/MTU. Typical for point-to-point underlay
@@ -431,6 +433,11 @@ async def configure_routed_port(interface: str = None, device: str = None, site:
       "ip_address": "10.1.1.0/31" | {device: cidr}, "mtu", "description",
       "enable", "vrf", "create_vrf", "remove_from_lag"}, ...] — any field
       omitted on an entry falls back to the matching top-level param.
+    - `unnumbered_interface` (e.g. 'loopback0'): IP-unnumbered — the port
+      borrows the primary IPv4 address of that interface instead of having its
+      own (typical for eBGP/OSPF unnumbered underlay). Mutually exclusive with
+      `ip_address`; the owner must exist and have an IP. `remove_unnumbered=True`
+      clears it. Also accepted per entry of `interfaces`.
     - `remove_from_lag=True`: if the port is currently a LAG member, pull it out
       of that LAG FIRST in this same call (result.interface.removed_from_lag
       names the LAG, with a warning that this bounces the remaining bundle) —
@@ -464,7 +471,9 @@ async def configure_routed_port(interface: str = None, device: str = None, site:
                     "action_required": "pass an interface name."}
         raw_ports = [{"interface": interface, "ip_address": ip_address, "mtu": mtu,
                     "description": description, "enable": enable, "vrf": vrf,
-                    "create_vrf": create_vrf, "remove_from_lag": remove_from_lag}]
+                    "create_vrf": create_vrf, "remove_from_lag": remove_from_lag,
+                    "unnumbered_interface": unnumbered_interface,
+                    "remove_unnumbered": remove_unnumbered}]
 
     port_specs = []
     for i, item in enumerate(raw_ports):
@@ -478,7 +487,15 @@ async def configure_routed_port(interface: str = None, device: str = None, site:
             "enable": item.get("enable", enable), "vrf": item.get("vrf", vrf) or "default",
             "create_vrf": item.get("create_vrf", create_vrf),
             "remove_from_lag": item.get("remove_from_lag", remove_from_lag),
+            "unnumbered_interface": item.get("unnumbered_interface", unnumbered_interface),
+            "remove_unnumbered": item.get("remove_unnumbered", remove_unnumbered),
         })
+        if (port_specs[-1]["unnumbered_interface"] and
+                (port_specs[-1]["ip_address"] or port_specs[-1]["remove_unnumbered"])):
+            return {"status": "invalid_input", "field": "unnumbered_interface",
+                    "error": f"{item['interface']}: `unnumbered_interface` is mutually "
+                             "exclusive with `ip_address` and `remove_unnumbered`.",
+                    "action_required": "pass only one of them."}
 
     resolved = []  # (spec, {dev: ip})
     for spec in port_specs:
@@ -509,6 +526,8 @@ async def configure_routed_port(interface: str = None, device: str = None, site:
                 steps.append({"action": "remove_from_lag", "interface": spec["interface"]})
             steps.append({"action": "configure_routed_interface", "interface": spec["interface"],
                          "ip4_address": ips.get(dev), "vrf": v, "mtu": spec["mtu"],
+                         "unnumbered_interface": spec["unnumbered_interface"],
+                         "remove_unnumbered": spec["remove_unnumbered"],
                          "admin": "up" if spec["enable"] else "down"})
         return steps
 
@@ -527,6 +546,8 @@ async def configure_routed_port(interface: str = None, device: str = None, site:
                 spec["interface"], ip_cidr=ips.get(dev), description=spec["description"],
                 mtu=spec["mtu"], vrf=v, enable=spec["enable"],
                 remove_from_lag=spec["remove_from_lag"],
+                unnumbered_interface=spec["unnumbered_interface"],
+                remove_unnumbered=spec["remove_unnumbered"],
                 delete_empty_lag=delete_empty_lags,
                 ensure_internal_vlan_range=ensure_internal_vlan_range,
                 internal_vlan_range_size=internal_vlan_range_size,

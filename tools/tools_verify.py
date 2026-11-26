@@ -42,7 +42,8 @@ async def verify_loopback(name: str, device: str = None, site: str = None) -> di
 @mcp.tool()
 async def verify_routed_port(interface: str, device: str = None,
                              site: str = None) -> dict:
-    """Verify a routed (L3) port: routing flag, ip4_address, ip_mtu, vrf, admin.
+    """Verify a routed (L3) port: routing flag, ip4_address, unnumbered_interface
+    (owner of the borrowed address when IP-unnumbered), ip_mtu, vrf, admin.
     Pair with configure_routed_port."""
     return await _domain_verify(
         "verify_routed_port", device, site,

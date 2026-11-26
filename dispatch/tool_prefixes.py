@@ -80,7 +80,7 @@ DOMAINS: dict[str, list[str]] = {
     ],
     "interface": [
         "get_interfaces", "get_transceivers", "get_loopbacks",
-        "get_interface_counters", "get_supported_transceivers",
+        "get_interface_counters", "get_unnumbered_interfaces", "get_supported_transceivers",
         "get_poe_status",
         "get_routed_ports", "get_vlan_interfaces", "get_lag",
         "configure_loopback", "configure_routed_port", "configure_lag",

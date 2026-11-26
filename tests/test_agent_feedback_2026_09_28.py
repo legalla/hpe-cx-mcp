@@ -199,3 +199,23 @@ def test_configure_routed_interface_removes_from_lag_first(client):
     assert result["removed_from_lag"] == "lag1"
     lag_puts = [b for p, b in rec.puts if p == "/system/interfaces/lag1"]
     assert lag_puts and "1/1/1" not in lag_puts[0]["interfaces"]
+
+
+# ─── IP-unnumbered ─────────────────────────────────────────────────────────
+
+def test_configure_routed_interface_unnumbered(client):
+    rec = _Recorder(client, {
+        "/system/interfaces/1%2F1%2F1": {"name": "1/1/1", "routing": True,
+                                        "ip4_address": "10.0.0.0/31",
+                                        "user_config": {"admin": "up"}},
+        "/system/interfaces/loopback0": {"name": "loopback0"},
+    })
+    res = asyncio.run(client.configure_routed_interface(
+        "1/1/1", unnumbered_interface="loopback0", verify_connected_route=False))
+    body = rec.puts[0][1]
+    assert "ip4_address" not in body
+    assert list(body["unnumbered"]["ipv4_address_owner_interface"]) == ["loopback0"]
+    assert res["unnumbered_interface"] == "loopback0"
+    with pytest.raises(ValueError):
+        asyncio.run(client.configure_routed_interface(
+            "1/1/1", ip_cidr="10.0.0.0/31", unnumbered_interface="loopback0"))

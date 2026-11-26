@@ -121,6 +121,15 @@ async def get_interfaces(device: str, interface: str = None) -> dict:
 
 
 @mcp.tool()
+async def get_unnumbered_interfaces(device: str, interface: str = None) -> dict:
+    """List IP-unnumbered interfaces and the owner interface (e.g. loopback0)
+    whose primary IPv4 address each one borrows. Set with
+    configure_routed_port(unnumbered_interface=...)."""
+    async with _get_client(device) as client:
+        return await client.get_unnumbered_interfaces(interface)
+
+
+@mcp.tool()
 async def get_interface_counters(device: str, interface: str = None) -> dict:
     """Interface traffic counters: rx/tx bytes & packets, error counters
     (CRC/frame/runts/giants), drops and aggregate totals. `interface` to target a
